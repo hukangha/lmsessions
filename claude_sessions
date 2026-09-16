@@ -14,32 +14,21 @@ def project_dir_for(cwd: Path) -> Path:
     return Path.home() / ".claude" / "projects" / encoded
 
 
-def session_names() -> dict[str, str]:
-    """Build a map of session_id -> custom name from ~/.claude/sessions/*.json."""
-    names: dict[str, str] = {}
-    sessions_dir = Path.home() / ".claude" / "sessions"
-    if not sessions_dir.is_dir():
-        return names
-    for f in sessions_dir.glob("*.json"):
-        try:
-            data = json.loads(f.read_text())
-            if "name" in data and "sessionId" in data:
-                names[data["sessionId"]] = data["name"]
-        except (json.JSONDecodeError, OSError):
-            continue
-    return names
-
-
-def ai_title(path: Path) -> str:
+def session_title(path: Path) -> str:
+    """Latest title for a session: a /rename custom title wins over the AI one."""
+    custom = ai = ""
     with path.open() as f:
         for line in f:
             try:
                 entry = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if entry.get("type") == "ai-title":
-                return entry.get("aiTitle", "")
-    return ""
+            typ = entry.get("type")
+            if typ == "custom-title":
+                custom = entry.get("customTitle", "") or custom
+            elif typ == "ai-title":
+                ai = entry.get("aiTitle", "") or ai
+    return custom or ai
 
 
 def list_sessions(project_dir: Path, cwd: Path) -> int:
@@ -47,14 +36,13 @@ def list_sessions(project_dir: Path, cwd: Path) -> int:
     if not files:
         print(f"No sessions for {cwd}")
         return 0
-    names = session_names()
     print(f"{'SESSION ID':38}  {'MODIFIED':19}  {'SIZE':>10}  {'MSGS':>5}  TITLE")
     for f in files:
         st = f.stat()
         mtime = datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
         with f.open("rb") as fh:
             lines = sum(1 for _ in fh)
-        title = names.get(f.stem) or ai_title(f)
+        title = session_title(f)
         print(f"{f.stem:38}  {mtime:19}  {st.st_size:>10}  {lines:>5}  {title}")
     return 0
 
