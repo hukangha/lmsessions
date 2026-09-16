@@ -2,10 +2,12 @@
 """List or remove Claude Code sessions for the current working directory."""
 
 import argparse
+import curses
 import json
 import os
 import sys
 from datetime import datetime
+from fnmatch import fnmatch
 from pathlib import Path
 
 
@@ -31,19 +33,35 @@ def session_title(path: Path) -> str:
     return custom or ai
 
 
-def list_sessions(project_dir: Path, cwd: Path) -> int:
+HEADER = f"{'SESSION ID':38}  {'MODIFIED':19}  {'SIZE':>10}  {'MSGS':>5}  TITLE"
+
+
+def session_rows(project_dir: Path) -> list[tuple[Path, str, int, int, str]]:
+    """(path, mtime, size, msgs, title) for every session, oldest first."""
     files = sorted(project_dir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime)
-    if not files:
-        print(f"No sessions for {cwd}")
-        return 0
-    print(f"{'SESSION ID':38}  {'MODIFIED':19}  {'SIZE':>10}  {'MSGS':>5}  TITLE")
+    rows = []
     for f in files:
         st = f.stat()
         mtime = datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
         with f.open("rb") as fh:
             lines = sum(1 for _ in fh)
-        title = session_title(f)
-        print(f"{f.stem:38}  {mtime:19}  {st.st_size:>10}  {lines:>5}  {title}")
+        rows.append((f, mtime, st.st_size, lines, session_title(f)))
+    return rows
+
+
+def format_row(row: tuple) -> str:
+    f, mtime, size, lines, title = row
+    return f"{f.stem:38}  {mtime:19}  {size:>10}  {lines:>5}  {title}"
+
+
+def list_sessions(project_dir: Path, cwd: Path) -> int:
+    rows = session_rows(project_dir)
+    if not rows:
+        print(f"No sessions for {cwd}")
+        return 0
+    print(HEADER)
+    for row in rows:
+        print(format_row(row))
     return 0
 
 
@@ -138,29 +156,94 @@ def dump_session(project_dir: Path, session_id: str, out_path: Path | None) -> i
     return 0
 
 
-def remove_one(project_dir: Path, session_id: str) -> int:
-    f = project_dir / f"{session_id}.jsonl"
-    if not f.is_file():
-        print(f"Session not found: {session_id}", file=sys.stderr)
-        return 1
-    f.unlink()
-    print(f"Removed session {session_id}")
-    return 0
-
-
-def remove_all(project_dir: Path, cwd: Path) -> int:
-    files = list(project_dir.glob("*.jsonl"))
-    if not files:
-        print(f"No sessions to remove for {cwd}")
-        return 0
-    ans = input(f"Remove {len(files)} session(s) for {cwd}? [y/N] ").strip().lower()
+def confirm_remove(rows: list[tuple], cwd: Path) -> int:
+    print(HEADER)
+    for row in rows:
+        print(format_row(row))
+    ans = input(f"Remove {len(rows)} session(s) for {cwd}? [y/N] ").strip().lower()
     if ans != "y":
         print("Aborted.")
         return 0
-    for f in files:
-        f.unlink()
-    print(f"Removed {len(files)} session(s).")
+    for row in rows:
+        row[0].unlink()
+    print(f"Removed {len(rows)} session(s).")
     return 0
+
+
+def remove_matching(project_dir: Path, cwd: Path, patterns: list[str]) -> int:
+    """Each pattern is an id, an id prefix, or a glob ('*' = every session)."""
+    rows = session_rows(project_dir)
+    matched = []
+    for pat in patterns:
+        hits = [r for r in rows if fnmatch(r[0].stem, pat) or r[0].stem.startswith(pat)]
+        if not hits:
+            print(f"No sessions match: {pat}", file=sys.stderr)
+        matched += [h for h in hits if h not in matched]
+    if not matched:
+        return 1
+    if len(matched) == 1 and matched[0][0].stem in patterns:
+        matched[0][0].unlink()
+        print(f"Removed session {matched[0][0].stem}")
+        return 0
+    return confirm_remove(matched, cwd)
+
+
+def pick_sessions(stdscr, rows: list[tuple]) -> list[int] | None:
+    """curses picker; returns marked row indexes, or None on Esc."""
+    curses.curs_set(0)
+    curses.use_default_colors()  # keep the terminal's own background
+    cur = top = 0
+    marks: list[int] = []  # in mark order, so `u` undoes the latest
+    footer = "j/k move   d mark   u undo   Enter confirm   Esc cancel"
+    while True:
+        h, w = stdscr.getmaxyx()
+        body = max(1, h - 2)
+        if cur < top:
+            top = cur
+        elif cur >= top + body:
+            top = cur - body + 1
+        stdscr.erase()
+        stdscr.addnstr(0, 0, "   " + HEADER, w - 1, curses.A_BOLD)
+        for y, i in enumerate(range(top, min(len(rows), top + body)), start=1):
+            mark = "D" if i in marks else " "
+            attr = curses.A_STANDOUT if i == cur else curses.A_NORMAL
+            stdscr.addnstr(y, 0, f" {mark} {format_row(rows[i])}", w - 1, attr)
+        stdscr.addnstr(h - 1, 0, footer, w - 1)
+        stdscr.refresh()
+        key = stdscr.getch()
+        if key in (ord("j"), curses.KEY_DOWN):
+            cur = min(cur + 1, len(rows) - 1)
+        elif key in (ord("k"), curses.KEY_UP):
+            cur = max(cur - 1, 0)
+        elif key == ord("d"):
+            if cur not in marks:
+                marks.append(cur)
+        elif key == ord("u"):
+            if marks:
+                marks.pop()
+        elif key in (10, 13, curses.KEY_ENTER):
+            return marks
+        elif key == 27:
+            return None
+
+
+def interactive_remove(project_dir: Path, cwd: Path) -> int:
+    if not sys.stdin.isatty():
+        print("Interactive removal needs a terminal; pass a pattern to -r.", file=sys.stderr)
+        return 1
+    rows = session_rows(project_dir)
+    if not rows:
+        print(f"No sessions for {cwd}")
+        return 0
+    os.environ.setdefault("ESCDELAY", "25")
+    marks = curses.wrapper(pick_sessions, rows)
+    if marks is None:
+        print("Cancelled.")
+        return 0
+    if not marks:
+        print("Nothing selected.")
+        return 0
+    return confirm_remove([rows[i] for i in sorted(marks)], cwd)
 
 
 def main() -> int:
@@ -171,9 +254,10 @@ def main() -> int:
     group.add_argument("-l", action="store_true", help="list sessions for $PWD")
     group.add_argument(
         "-r",
-        metavar="SESSION_ID",
-        nargs="+",
-        help="remove one or more session ids, or 'all' to remove every session for $PWD",
+        metavar="PATTERN",
+        nargs="*",
+        help="remove sessions matching id/prefix/glob ('*' = all, quote it); "
+        "with no argument, pick interactively",
     )
     group.add_argument(
         "-d",
@@ -200,12 +284,9 @@ def main() -> int:
     if args.d:
         out_path = Path(args.o) if args.o else None
         return dump_session(project_dir, args.d, out_path)
-    if "all" in args.r:
-        return remove_all(project_dir, cwd)
-    ret = 0
-    for sid in args.r:
-        ret |= remove_one(project_dir, sid)
-    return ret
+    if args.r:
+        return remove_matching(project_dir, cwd, args.r)
+    return interactive_remove(project_dir, cwd)
 
 
 if __name__ == "__main__":
