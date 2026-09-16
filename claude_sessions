@@ -2,10 +2,13 @@
 """List or remove Claude Code sessions for the current working directory."""
 
 import argparse
-import curses
 import json
 import os
+import select
+import shutil
 import sys
+import termios
+import tty
 from datetime import datetime
 from fnmatch import fnmatch
 from pathlib import Path
@@ -188,43 +191,67 @@ def remove_matching(project_dir: Path, cwd: Path, patterns: list[str]) -> int:
     return confirm_remove(matched, cwd)
 
 
-def pick_sessions(stdscr, rows: list[tuple]) -> list[int] | None:
-    """curses picker; returns marked row indexes, or None on Esc."""
-    curses.curs_set(0)
-    curses.use_default_colors()  # keep the terminal's own background
+def read_key(fd: int) -> str:
+    ch = os.read(fd, 1)
+    if ch != b"\x1b":
+        return ch.decode(errors="replace")
+    # A bare Esc has nothing following it; arrow keys arrive as ESC [ A / ESC O A.
+    if select.select([fd], [], [], 0.025)[0]:
+        seq = os.read(fd, 8)
+        return {b"[A": "up", b"OA": "up", b"[B": "down", b"OB": "down"}.get(seq, "")
+    return "esc"
+
+
+def pick_sessions(rows: list[tuple]) -> list[int] | None:
+    """Inline picker drawn below the cursor; returns marked row indexes, or None on q/Esc."""
+    fd = sys.stdin.fileno()
+    out = sys.stdout
+    term = shutil.get_terminal_size()
+    width = term.columns - 1
+    body = min(len(rows), max(1, term.lines - 3))
+    total = body + 2  # header + rows + footer
     cur = top = 0
     marks: list[int] = []  # in mark order, so `u` undoes the latest
-    footer = "j/k move   d mark   u undo   Enter confirm   Esc cancel"
-    while True:
-        h, w = stdscr.getmaxyx()
-        body = max(1, h - 2)
-        if cur < top:
-            top = cur
-        elif cur >= top + body:
-            top = cur - body + 1
-        stdscr.erase()
-        stdscr.addnstr(0, 0, "   " + HEADER, w - 1, curses.A_BOLD)
-        for y, i in enumerate(range(top, min(len(rows), top + body)), start=1):
-            mark = "D" if i in marks else " "
-            attr = curses.A_STANDOUT if i == cur else curses.A_NORMAL
-            stdscr.addnstr(y, 0, f" {mark} {format_row(rows[i])}", w - 1, attr)
-        stdscr.addnstr(h - 1, 0, footer, w - 1)
-        stdscr.refresh()
-        key = stdscr.getch()
-        if key in (ord("j"), curses.KEY_DOWN):
-            cur = min(cur + 1, len(rows) - 1)
-        elif key in (ord("k"), curses.KEY_UP):
-            cur = max(cur - 1, 0)
-        elif key == ord("d"):
-            if cur not in marks:
-                marks.append(cur)
-        elif key == ord("u"):
-            if marks:
-                marks.pop()
-        elif key in (10, 13, curses.KEY_ENTER):
-            return marks
-        elif key == 27:
-            return None
+    footer = "j/k move   d mark   u undo   Enter confirm   q/Esc cancel"
+
+    old = termios.tcgetattr(fd)
+    tty.setcbreak(fd)
+    out.write("\n" * total + f"\x1b[{total}A")  # make room below the cursor
+    try:
+        while True:
+            if cur < top:
+                top = cur
+            elif cur >= top + body:
+                top = cur - body + 1
+            lines = [f"\x1b[1m   {HEADER}\x1b[0m"]
+            for i in range(top, top + body):
+                mark = "D" if i in marks else " "
+                line = f" {mark} {format_row(rows[i])}"[:width]
+                lines.append(f"\x1b[7m{line}\x1b[0m" if i == cur else line)
+            lines.append(footer)
+            out.write("".join(f"\r\x1b[K{line}\n" for line in lines) + f"\x1b[{total}A")
+            out.flush()
+            key = read_key(fd)
+            if key in ("j", "down"):
+                cur = min(cur + 1, len(rows) - 1)
+            elif key in ("k", "up"):
+                cur = max(cur - 1, 0)
+            elif key == "d":
+                if cur not in marks:
+                    marks.append(cur)
+            elif key == "u":
+                if marks:
+                    marks.pop()
+            elif key in ("\r", "\n"):
+                return marks
+            elif key in ("q", "esc"):
+                return None
+    except KeyboardInterrupt:
+        return None
+    finally:
+        out.write("\r\x1b[J")  # erase the picker
+        out.flush()
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 
 def interactive_remove(project_dir: Path, cwd: Path) -> int:
@@ -235,8 +262,7 @@ def interactive_remove(project_dir: Path, cwd: Path) -> int:
     if not rows:
         print(f"No sessions for {cwd}")
         return 0
-    os.environ.setdefault("ESCDELAY", "25")
-    marks = curses.wrapper(pick_sessions, rows)
+    marks = pick_sessions(rows)
     if marks is None:
         print("Cancelled.")
         return 0
