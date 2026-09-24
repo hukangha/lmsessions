@@ -432,9 +432,14 @@ def main() -> int:
         metavar="FILE",
         help="output file for -d (default: SESSION_ID.txt in the current dir)",
     )
-    args = parser.parse_args()
-
     cwd = Path(os.getcwd()).resolve()
+
+    if len(sys.argv) == 1:
+        parser.print_usage()
+        print()
+        return list_sessions(cwd)
+
+    args = parser.parse_args()
 
     if args.l:
         return list_sessions(cwd)
