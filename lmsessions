@@ -507,9 +507,11 @@ def main() -> int:
         + " sessions for the current working directory (or every directory with -a).",
     )
     group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("-l", action="store_true", help="list sessions for $PWD")
+    group.add_argument("-l", "--list", dest="l", action="store_true", help="list sessions for $PWD")
     group.add_argument(
         "-r",
+        "--remove",
+        dest="r",
         metavar="PATTERN",
         nargs="*",
         help="remove sessions matching id/prefix/glob ('*' = all, quote it); "
@@ -517,6 +519,8 @@ def main() -> int:
     )
     group.add_argument(
         "-d",
+        "--dump",
+        dest="d",
         metavar="SESSION_ID",
         help="dump a session's conversation to SESSION_ID.txt (or -o FILE)",
     )
