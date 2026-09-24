@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""List, remove or dump coding-agent sessions (Claude Code, Codex) for the current working directory.
+"""List, search, remove or dump coding-agent sessions (Claude Code, Codex) for the
+current working directory, or for every directory with -a.
 
 To support another agent, subclass `Agent` and add an instance to `AGENTS`.
 """
@@ -7,6 +8,7 @@ To support another agent, subclass `Agent` and add an instance to `AGENTS`.
 import argparse
 import json
 import os
+import re
 import select
 import shutil
 import sqlite3
@@ -28,6 +30,7 @@ class Session:
     msgs: int
     title: str
     path: Path
+    cwd: str
 
 
 Turn = tuple[str, str, str]  # (role, timestamp, body)
@@ -69,7 +72,8 @@ def tool_marker(name: str, inp: dict) -> str:
 class Agent:
     name: str
 
-    def sessions(self, cwd: Path) -> list[Session]:
+    def sessions(self, cwd: Path | None) -> list[Session]:
+        """Sessions started in cwd, or in any directory if cwd is None."""
         raise NotImplementedError
 
     def remove(self, s: Session) -> None:
@@ -83,25 +87,28 @@ class Agent:
 class ClaudeAgent(Agent):
     name = "claude"
 
-    def sessions(self, cwd: Path) -> list[Session]:
-        project_dir = Path.home() / ".claude" / "projects" / str(cwd).replace("/", "-")
+    def sessions(self, cwd: Path | None) -> list[Session]:
+        projects = Path.home() / ".claude" / "projects"
+        pattern = "*/*.jsonl" if cwd is None else str(cwd).replace("/", "-") + "/*.jsonl"
         out = []
-        for f in project_dir.glob("*.jsonl"):
+        for f in projects.glob(pattern):
             size, msgs = file_stats(f)
-            out.append(Session(self.name, f.stem, f.stat().st_mtime, size, msgs, self.title(f), f))
+            title, scwd = self.title_and_cwd(f)
+            out.append(Session(self.name, f.stem, f.stat().st_mtime, size, msgs, title, f, scwd or str(cwd or "")))
         return out
 
     @staticmethod
-    def title(path: Path) -> str:
-        """Latest title for a session: a /rename custom title wins over the AI one."""
-        custom = ai = ""
+    def title_and_cwd(path: Path) -> tuple[str, str]:
+        """Latest title (a /rename custom title wins over the AI one) and the session's cwd."""
+        custom = ai = cwd = ""
         for entry in read_jsonl(path):
             typ = entry.get("type")
             if typ == "custom-title":
                 custom = entry.get("customTitle", "") or custom
             elif typ == "ai-title":
                 ai = entry.get("aiTitle", "") or ai
-        return custom or ai
+            cwd = cwd or entry.get("cwd", "")
+        return custom or ai, cwd
 
     def remove(self, s: Session) -> None:
         s.path.unlink()
@@ -157,25 +164,25 @@ class CodexAgent(Agent):
         home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).expanduser()
         self.db = home / "state_5.sqlite"
 
-    def sessions(self, cwd: Path) -> list[Session]:
+    def sessions(self, cwd: Path | None) -> list[Session]:
         if not self.db.exists():
             return []
+        query = "SELECT id, name, title, updated_at, updated_at_ms, rollout_path, cwd FROM threads"
         conn = sqlite3.connect(self.db)
         try:
-            rows = conn.execute(
-                "SELECT id, name, title, updated_at, updated_at_ms, rollout_path"
-                " FROM threads WHERE cwd = ?",
-                (str(cwd),),
-            ).fetchall()
+            if cwd is None:
+                rows = conn.execute(query).fetchall()
+            else:
+                rows = conn.execute(query + " WHERE cwd = ?", (str(cwd),)).fetchall()
         finally:
             conn.close()
         out = []
-        for sid, name, title, updated_at, updated_at_ms, rollout in rows:
+        for sid, name, title, updated_at, updated_at_ms, rollout, scwd in rows:
             path = Path(rollout)
             mtime = updated_at_ms / 1000 if updated_at_ms is not None else updated_at
             size, msgs = file_stats(path)
             title = " ".join((name or title or "").split())
-            out.append(Session(self.name, sid, mtime, size, msgs, title, path))
+            out.append(Session(self.name, sid, mtime, size, msgs, title, path, scwd))
         return out
 
     def remove(self, s: Session) -> None:
@@ -235,35 +242,120 @@ class CodexAgent(Agent):
 AGENTS: list[Agent] = [ClaudeAgent(), CodexAgent()]
 
 
-HEADER = f"{'AGENT':6}  {'SESSION ID':38}  {'MODIFIED':19}  {'SIZE':>10}  {'MSGS':>5}  TITLE"
-
-
-def all_sessions(cwd: Path) -> list[Session]:
-    """Sessions of every agent for cwd, oldest first."""
+def all_sessions(cwd: Path | None) -> list[Session]:
+    """Sessions of every agent for cwd (None = every directory), oldest first."""
     return sorted((s for a in AGENTS for s in a.sessions(cwd)), key=lambda s: s.mtime)
+
+
+def where(cwd: Path | None) -> str:
+    return str(cwd) if cwd else "any directory"
+
+
+def cwd_width(rows: list[Session], cwd: Path | None) -> int:
+    """Width of the CWD column: shown only when listing every directory."""
+    return max((len(r.cwd) for r in rows), default=0) if cwd is None else 0
+
+
+def header(cw: int = 0) -> str:
+    col = f"{'CWD':{cw}}  " if cw else ""
+    return f"{'AGENT':6}  {'SESSION ID':38}  {'MODIFIED':19}  {'SIZE':>10}  {'MSGS':>5}  {col}TITLE"
 
 
 def agent_of(s: Session) -> Agent:
     return next(a for a in AGENTS if a.name == s.agent)
 
 
-def format_row(s: Session) -> str:
+def format_row(s: Session, cw: int = 0) -> str:
     mtime = datetime.fromtimestamp(s.mtime).strftime("%Y-%m-%d %H:%M:%S")
-    return f"{s.agent:6}  {s.id:38}  {mtime:19}  {s.size:>10}  {s.msgs:>5}  {s.title}"
+    col = f"{s.cwd:{cw}}  " if cw else ""
+    return f"{s.agent:6}  {s.id:38}  {mtime:19}  {s.size:>10}  {s.msgs:>5}  {col}{s.title}"
 
 
-def list_sessions(cwd: Path) -> int:
+def list_sessions(cwd: Path | None) -> int:
     rows = all_sessions(cwd)
     if not rows:
-        print(f"No sessions for {cwd}")
+        print(f"No sessions for {where(cwd)}")
         return 0
-    print(HEADER)
+    cw = cwd_width(rows, cwd)
+    print(header(cw))
     for row in rows:
-        print(format_row(row))
+        print(format_row(row, cw))
     return 0
 
 
-def dump_session(cwd: Path, session_id: str, out_path: Path | None) -> int:
+def snippet(line: str, m: re.Match, width: int = 120) -> str:
+    """The part of line around match m, at most about width chars."""
+    start = max(0, m.start() - (width - (m.end() - m.start())) // 2)
+    text = line[start:start + width]
+    return ("…" if start else "") + text + ("…" if start + width < len(line) else "")
+
+
+def terminal_bg() -> tuple[int, int, int] | None:
+    """The terminal's background as 8-bit RGB, asked for with OSC 11; None if it doesn't answer."""
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return None
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    tty.setcbreak(fd)
+    try:
+        sys.stdout.write("\x1b]11;?\x1b\\")
+        sys.stdout.flush()
+        reply = b""
+        while not reply.endswith((b"\x07", b"\x1b\\")) and select.select([fd], [], [], 0.1)[0]:
+            reply += os.read(fd, 64)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+    m = re.search(rb"rgb:([0-9a-fA-F]+)/([0-9a-fA-F]+)/([0-9a-fA-F]+)", reply)
+    if not m:
+        return None
+    return tuple(int(c, 16) * 255 // (16 ** len(c) - 1) for c in m.groups())
+
+
+def shade_code() -> str:
+    """Background escape for a slightly lighter (dark theme) or darker (light theme) terminal bg."""
+    bg = terminal_bg()
+    if bg is None:
+        return "\x1b[48;5;236m"
+    step = 20 if sum(bg) < 3 * 128 else -20
+    r, g, b = (min(255, max(0, c + step)) for c in bg)
+    return f"\x1b[48;2;{r};{g};{b}m"
+
+
+def search_sessions(cwd: Path | None, pattern: str, max_hits: int = 3) -> int:
+    """List sessions whose title or transcript matches the regex pattern (case-insensitive)."""
+    try:
+        rx = re.compile(pattern, re.IGNORECASE)
+    except re.error as e:
+        print(f"Bad pattern {pattern!r}: {e}", file=sys.stderr)
+        return 1
+    color = sys.stdout.isatty()
+    shade = shade_code() if color else ""
+    rows = all_sessions(cwd)
+    cw = cwd_width(rows, cwd)
+    found = 0
+    for s in rows:
+        lines = [s.title] + [l for _, _, body in agent_of(s).transcript(s) for l in body.splitlines()]
+        hits = list(dict.fromkeys(snippet(l.strip(), m) for l in lines if (m := rx.search(l.strip()))))
+        if not hits:
+            continue
+        if not found:
+            print(header(cw))
+        found += 1
+        print(format_row(s, cw))
+        for h in hits[:max_hits]:
+            if color:
+                h = shade + rx.sub(lambda m: f"\x1b[1m{m[0]}\x1b[22m", h) + "\x1b[0m"
+            print(f"        │ {h}")
+        if len(hits) > max_hits:
+            print(f"        │ … {len(hits) - max_hits} more")
+        sys.stdout.flush()
+    if not found:
+        print(f"No sessions in {where(cwd)} match: {pattern}")
+        return 1
+    return 0
+
+
+def dump_session(cwd: Path | None, session_id: str, out_path: Path | None) -> int:
     """Write a clean, readable dump of a session transcript.
 
     Keeps real user-typed text, assistant text, and compact one-line tool
@@ -292,11 +384,12 @@ def dump_session(cwd: Path, session_id: str, out_path: Path | None) -> int:
     return 0
 
 
-def confirm_remove(rows: list[Session], cwd: Path) -> int:
-    print(HEADER)
+def confirm_remove(rows: list[Session], cwd: Path | None) -> int:
+    cw = cwd_width(rows, cwd)
+    print(header(cw))
     for row in rows:
-        print(format_row(row))
-    ans = input(f"Remove {len(rows)} session(s) for {cwd}? [y/N] ").strip().lower()
+        print(format_row(row, cw))
+    ans = input(f"Remove {len(rows)} session(s) for {where(cwd)}? [y/N] ").strip().lower()
     if ans != "y":
         print("Aborted.")
         return 0
@@ -306,7 +399,7 @@ def confirm_remove(rows: list[Session], cwd: Path) -> int:
     return 0
 
 
-def remove_matching(cwd: Path, patterns: list[str]) -> int:
+def remove_matching(cwd: Path | None, patterns: list[str]) -> int:
     """Each pattern is an id, an id prefix, or a glob ('*' = every session)."""
     rows = all_sessions(cwd)
     matched = []
@@ -335,7 +428,7 @@ def read_key(fd: int) -> str:
     return "esc"
 
 
-def pick_sessions(rows: list[Session]) -> list[int] | None:
+def pick_sessions(rows: list[Session], cw: int) -> list[int] | None:
     """Inline picker drawn below the cursor; returns marked row indexes, or None on q/Esc."""
     fd = sys.stdin.fileno()
     out = sys.stdout
@@ -358,10 +451,10 @@ def pick_sessions(rows: list[Session]) -> list[int] | None:
                 top = cur
             elif cur >= top + body:
                 top = cur - body + 1
-            lines = [f"\x1b[1m   {HEADER}\x1b[0m"]
+            lines = [f"\x1b[1m   {header(cw)}\x1b[0m"]
             for i in range(top, top + body):
                 mark = "D" if i in marks else " "
-                line = f" {mark} {format_row(rows[i])}"[:width]
+                line = f" {mark} {format_row(rows[i], cw)}"[:width]
                 lines.append(f"\x1b[7m{line}\x1b[0m" if i == cur else line)
             lines.append(footer)
             out.write("".join(f"\r\x1b[K{line}\n" for line in lines) + f"\x1b[{total}A")
@@ -389,15 +482,15 @@ def pick_sessions(rows: list[Session]) -> list[int] | None:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 
-def interactive_remove(cwd: Path) -> int:
+def interactive_remove(cwd: Path | None) -> int:
     if not sys.stdin.isatty():
         print("Interactive removal needs a terminal; pass a pattern to -r.", file=sys.stderr)
         return 1
     rows = all_sessions(cwd)
     if not rows:
-        print(f"No sessions for {cwd}")
+        print(f"No sessions for {where(cwd)}")
         return 0
-    marks = pick_sessions(rows)
+    marks = pick_sessions(rows, cwd_width(rows, cwd))
     if marks is None:
         print("Cancelled.")
         return 0
@@ -409,9 +502,9 @@ def interactive_remove(cwd: Path) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="List, remove or dump "
+        description="List, search, remove or dump "
         + "/".join(a.name for a in AGENTS)
-        + " sessions for the current working directory.",
+        + " sessions for the current working directory (or every directory with -a).",
     )
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("-l", action="store_true", help="list sessions for $PWD")
@@ -427,22 +520,35 @@ def main() -> int:
         metavar="SESSION_ID",
         help="dump a session's conversation to SESSION_ID.txt (or -o FILE)",
     )
+    group.add_argument(
+        "-s",
+        "--search",
+        metavar="REGEX",
+        help="list sessions whose title or conversation matches REGEX (case-insensitive)",
+    )
+    parser.add_argument(
+        "-a",
+        "--all",
+        action="store_true",
+        help="apply -l/-r/-d/-s to sessions in every directory, not just $PWD",
+    )
     parser.add_argument(
         "-o",
         metavar="FILE",
         help="output file for -d (default: SESSION_ID.txt in the current dir)",
     )
-    cwd = Path(os.getcwd()).resolve()
-
-    if len(sys.argv) == 1:
+    if set(sys.argv[1:]) <= {"-a", "--all"}:
         parser.print_usage()
         print()
-        return list_sessions(cwd)
+        return list_sessions(None if sys.argv[1:] else Path(os.getcwd()).resolve())
 
     args = parser.parse_args()
+    cwd = None if args.all else Path(os.getcwd()).resolve()
 
     if args.l:
         return list_sessions(cwd)
+    if args.search is not None:
+        return search_sessions(cwd, args.search)
     if args.d:
         out_path = Path(args.o) if args.o else None
         return dump_session(cwd, args.d, out_path)
