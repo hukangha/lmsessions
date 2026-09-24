@@ -349,7 +349,9 @@ def pick_sessions(rows: list[Session]) -> list[int] | None:
 
     old = termios.tcgetattr(fd)
     tty.setcbreak(fd)
-    out.write("\n" * total + f"\x1b[{total}A")  # make room below the cursor
+    # Autowrap off: a line wider than the terminal would take two rows and
+    # break the fixed cursor-up count, leaving stale lines behind.
+    out.write("\x1b[?7l" + "\n" * total + f"\x1b[{total}A")  # make room below the cursor
     try:
         while True:
             if cur < top:
@@ -382,7 +384,7 @@ def pick_sessions(rows: list[Session]) -> list[int] | None:
     except KeyboardInterrupt:
         return None
     finally:
-        out.write("\r\x1b[J")  # erase the picker
+        out.write("\r\x1b[J\x1b[?7h")  # erase the picker, restore autowrap
         out.flush()
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
