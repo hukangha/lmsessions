@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""List, search, remove or dump coding-agent sessions (Claude Code, Codex) for the
-current working directory, or for every directory with -a.
+"""List, search, remove or dump coding-agent sessions (Claude Code, Codex,
+OpenCode) for the current working directory, or for every directory with -a.
 
 To support another agent, subclass `Agent` and add an instance to `AGENTS`.
 """
@@ -59,7 +59,7 @@ def read_jsonl(path: Path):
 
 
 def tool_marker(name: str, inp: dict) -> str:
-    for k in ("description", "command", "file_path", "prompt", "query", "pattern", "cmd", "input"):
+    for k in ("description", "command", "file_path", "path", "prompt", "query", "pattern", "cmd", "input"):
         v = inp.get(k)
         if v:
             v = " ".join(str(v).split())
@@ -239,7 +239,111 @@ class CodexAgent(Agent):
         return turns
 
 
-AGENTS: list[Agent] = [ClaudeAgent(), CodexAgent()]
+class OpenCodeAgent(Agent):
+    name = "opencode"
+
+    def __init__(self):
+        data_home = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share")
+        self.db = (data_home / "opencode" / "opencode.db").expanduser()
+
+    def connect(self, readonly: bool = True) -> sqlite3.Connection:
+        if readonly:
+            return sqlite3.connect(self.db.resolve().as_uri() + "?mode=ro", uri=True, timeout=5)
+        return sqlite3.connect(self.db, timeout=10)
+
+    def sessions(self, cwd: Path | None) -> list[Session]:
+        if not self.db.is_file():
+            return []
+        query = (
+            "SELECT s.id, s.directory, s.title, s.slug, s.time_updated,"
+            " COALESCE(m.size, 0), COALESCE(m.msgs, 0)"
+            " FROM session_v2 AS s LEFT JOIN ("
+            " SELECT session_id, SUM(length(CAST(data AS BLOB))) AS size, COUNT(*) AS msgs"
+            " FROM session_message GROUP BY session_id"
+            ") AS m ON m.session_id = s.id"
+        )
+        params: tuple[str, ...] = ()
+        if cwd is not None:
+            query += " WHERE s.directory = ?"
+            params = (str(cwd),)
+        try:
+            conn = self.connect()
+            try:
+                rows = conn.execute(query, params).fetchall()
+            finally:
+                conn.close()
+        except sqlite3.DatabaseError:
+            return []
+        out = []
+        for sid, directory, title, slug, updated, size, msgs in rows:
+            title = " ".join((title or slug or "").split())
+            out.append(Session(self.name, sid, updated / 1000, size, msgs, title, self.db, directory))
+        return out
+
+    def remove(self, s: Session) -> None:
+        if not self.db.is_file():
+            return
+        conn = self.connect(readonly=False)
+        try:
+            conn.execute("PRAGMA foreign_keys = ON")
+            conn.execute("DELETE FROM session_v2 WHERE id = ?", (s.id,))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def transcript(self, s: Session) -> list[Turn]:
+        if not self.db.is_file():
+            return []
+        try:
+            conn = self.connect()
+            try:
+                rows = conn.execute(
+                    "SELECT type, data FROM session_message WHERE session_id = ? ORDER BY seq",
+                    (s.id,),
+                ).fetchall()
+            finally:
+                conn.close()
+        except sqlite3.DatabaseError:
+            return []
+        turns = []
+        for typ, raw in rows:
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            ts = self.timestamp(data.get("time") or {})
+            if typ == "user":
+                body = (data.get("text") or "").strip()
+                if body:
+                    turns.append(("USER", ts, body))
+            elif typ == "assistant":
+                lines = []
+                for part in data.get("content") or []:
+                    if not isinstance(part, dict):
+                        continue
+                    if part.get("type") == "text":
+                        text = (part.get("text") or "").strip()
+                        if text:
+                            lines.append(text)
+                    elif part.get("type") == "tool":
+                        state = part.get("state") or {}
+                        inp = state.get("input") if isinstance(state, dict) else {}
+                        name = part.get("name") or part.get("tool") or "?"
+                        lines.append(tool_marker(name, inp if isinstance(inp, dict) else {}))
+                if lines:
+                    turns.append(("ASSISTANT", ts, "\n".join(lines)))
+        return turns
+
+    @staticmethod
+    def timestamp(time: dict) -> str:
+        created = time.get("created")
+        if not isinstance(created, (int, float)):
+            return ""
+        return datetime.fromtimestamp(created / 1000).strftime("%Y-%m-%d %H:%M:%S")
+
+
+AGENTS: list[Agent] = [ClaudeAgent(), CodexAgent(), OpenCodeAgent()]
+AGENT_WIDTH = max(len(a.name) for a in AGENTS)
 
 
 def all_sessions(cwd: Path | None) -> list[Session]:
@@ -258,7 +362,7 @@ def cwd_width(rows: list[Session], cwd: Path | None) -> int:
 
 def header(cw: int = 0) -> str:
     col = f"{'CWD':{cw}}  " if cw else ""
-    return f"{'AGENT':6}  {'SESSION ID':38}  {'MODIFIED':19}  {'SIZE':>10}  {'MSGS':>5}  {col}TITLE"
+    return f"{'AGENT':{AGENT_WIDTH}}  {'SESSION ID':38}  {'MODIFIED':19}  {'SIZE':>10}  {'MSGS':>5}  {col}TITLE"
 
 
 def agent_of(s: Session) -> Agent:
@@ -268,7 +372,7 @@ def agent_of(s: Session) -> Agent:
 def format_row(s: Session, cw: int = 0) -> str:
     mtime = datetime.fromtimestamp(s.mtime).strftime("%Y-%m-%d %H:%M:%S")
     col = f"{s.cwd:{cw}}  " if cw else ""
-    return f"{s.agent:6}  {s.id:38}  {mtime:19}  {s.size:>10}  {s.msgs:>5}  {col}{s.title}"
+    return f"{s.agent:{AGENT_WIDTH}}  {s.id:38}  {mtime:19}  {s.size:>10}  {s.msgs:>5}  {col}{s.title}"
 
 
 def list_sessions(cwd: Path | None) -> int:
