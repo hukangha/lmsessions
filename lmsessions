@@ -89,13 +89,26 @@ class ClaudeAgent(Agent):
 
     def sessions(self, cwd: Path | None) -> list[Session]:
         projects = Path.home() / ".claude" / "projects"
-        pattern = "*/*.jsonl" if cwd is None else str(cwd).replace("/", "-") + "/*.jsonl"
+        if cwd is None:
+            files = projects.glob("*/*.jsonl")
+        else:
+            files = (projects / self.project_name(cwd)).glob("*.jsonl")
         out = []
-        for f in projects.glob(pattern):
+        target = os.path.realpath(cwd) if cwd is not None else None
+        for f in files:
             size, msgs = file_stats(f)
             title, scwd = self.title_and_cwd(f)
+            # Distinct paths can share one project dir ("a_b" and "a.b" both become
+            # "a-b"), so keep only sessions actually started in cwd.
+            if target and scwd and os.path.realpath(scwd) != target:
+                continue
             out.append(Session(self.name, f.stem, f.stat().st_mtime, size, msgs, title, f, scwd or str(cwd or "")))
         return out
+
+    @staticmethod
+    def project_name(cwd: Path) -> str:
+        """Claude Code's project dir name for cwd: every non-alphanumeric char becomes '-'."""
+        return re.sub(r"[^a-zA-Z0-9]", "-", str(cwd))
 
     @staticmethod
     def title_and_cwd(path: Path) -> tuple[str, str]:
