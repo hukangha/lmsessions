@@ -6,6 +6,7 @@ To support another agent, subclass `Agent` and add an instance to `AGENTS`.
 """
 
 import argparse
+import base64
 import json
 import os
 import re
@@ -562,6 +563,12 @@ def remove_matching(cwd: Path | None, patterns: list[str]) -> int:
     return 0
 
 
+def copy_to_clipboard(text: str) -> None:
+    """Copy text with the OSC 52 escape, which needs no external tools and works over SSH."""
+    sys.stdout.write(f"\x1b]52;c;{base64.b64encode(text.encode()).decode()}\x07")
+    sys.stdout.flush()
+
+
 def read_key(fd: int) -> str:
     ch = os.read(fd, 1)
     if ch != b"\x1b":
@@ -590,7 +597,8 @@ def pick_sessions(rows: list[Session], cw: int, marks: list[int] | None = None) 
     marks = list(marks or [])  # in mark order, so `u` undoes the latest
     if marks:  # resumed after Esc at the confirmation: start at the first mark
         cur = top = min(marks)
-    footer = "j/k move  Ctrl+f/b page  Shift+↑/↓ select  d toggle  u undo  Enter confirm  q/Esc cancel"
+    footer = "j/k move  Ctrl+f/b page  Shift+↑/↓ select  d toggle  u undo  y copy id  Enter confirm  q/Esc cancel"
+    status = ""  # one-frame footer message, e.g. after yanking an id
 
     old = termios.tcgetattr(fd)
     tty.setcbreak(fd)
@@ -608,10 +616,11 @@ def pick_sessions(rows: list[Session], cw: int, marks: list[int] | None = None) 
                 mark = "D" if i in marks else " "
                 line = f" {mark} {format_row(rows[i], cw)}"[:width]
                 lines.append(f"\x1b[7m{line}\x1b[0m" if i == cur else line)
-            lines.append(footer)
+            lines.append(status or footer)
             out.write("".join(f"\r\x1b[K{line}\n" for line in lines) + f"\x1b[{total}A")
             out.flush()
             key = read_key(fd)
+            status = ""
             if key in ("j", "down"):
                 cur = min(cur + 1, len(rows) - 1)
             elif key in ("k", "up"):
@@ -633,6 +642,9 @@ def pick_sessions(rows: list[Session], cw: int, marks: list[int] | None = None) 
             elif key == "u":
                 if marks:
                     marks.pop()
+            elif key == "y":
+                copy_to_clipboard(rows[cur].id)
+                status = f"Copied {rows[cur].id}"
             elif key in ("\r", "\n"):
                 return marks
             elif key in ("q", "esc"):
