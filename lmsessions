@@ -717,9 +717,19 @@ def interactive_remove(cwd: Path | None) -> int:
         if not picked:
             print("Nothing selected.")
             return 0
-        if confirm_remove([rows[i] for i in sorted(picked)], cwd, allow_back=True) != "back":
+        result = confirm_remove([rows[i] for i in sorted(picked)], cwd, allow_back=True)
+        if result == "back":
+            marks = picked  # Esc at the confirmation: back to the picker, selection kept
+            continue
+        if result == "aborted":
             return 0
-        marks = picked  # Esc at the confirmation: back to the picker, selection kept
+        # Removed: pick again from what is left instead of exiting.
+        rows = all_sessions(cwd)
+        if not rows:
+            print(f"No sessions left for {where(cwd)}")
+            return 0
+        cw = cwd_width(rows, cwd)
+        marks = []
 
 
 def main() -> int:
