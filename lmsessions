@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """List, search, remove, dump or resume coding-agent sessions (Claude Code,
-Codex, OpenCode) for the current working directory, or for every directory with
--a. With no arguments, open the interactive menu.
+Codex, OpenCode). With no arguments, open the interactive menu; -l lists them
+instead (add -a for every directory); press / in the menu to search.
 
 To support another agent, subclass `Agent` and add an instance to `AGENTS`.
 """
@@ -20,7 +20,6 @@ import termios
 import tty
 from dataclasses import dataclass
 from datetime import datetime
-from fnmatch import fnmatch
 from pathlib import Path
 
 
@@ -37,6 +36,7 @@ class Session:
 
 
 Turn = tuple[str, str, str]  # (role, timestamp, body)
+Hit = tuple[str, int, int]  # (snippet text, match start, match end within the snippet)
 
 
 def file_size(path: Path) -> int:
@@ -472,11 +472,17 @@ def list_sessions(cwd: Path | None) -> int:
     return 0
 
 
-def snippet(line: str, m: re.Match, width: int = 120) -> str:
-    """The part of line around match m, at most about width chars."""
+def snippet(line: str, m: re.Match, width: int = 120) -> Hit:
+    """The part of line around match m, at most about width chars, and the match span in it."""
     start = max(0, m.start() - (width - (m.end() - m.start())) // 2)
-    text = line[start:start + width]
-    return ("…" if start else "") + text + ("…" if start + width < len(line) else "")
+    end = start + width
+    text = line[start:end]
+    lead = 1 if start else 0
+    return (
+        "…" * lead + text + ("…" if end < len(line) else ""),
+        lead + m.start() - start,
+        lead + min(m.end(), end) - start,
+    )
 
 
 def terminal_bg() -> tuple[int, int, int] | None:
@@ -500,63 +506,30 @@ def terminal_bg() -> tuple[int, int, int] | None:
     return tuple(int(c, 16) * 255 // (16 ** len(c) - 1) for c in m.groups())
 
 
-def shade_code() -> str:
-    """Background escape for a slightly lighter (dark theme) or darker (light theme) terminal bg."""
+def shade_codes() -> tuple[str, str]:
+    """Background escapes slightly off the terminal bg: (row highlight, keyword highlight)."""
     bg = terminal_bg()
     if bg is None:
-        return "\x1b[48;5;236m"
+        return "\x1b[48;5;236m", "\x1b[48;5;240m"
     step = 20 if sum(bg) < 3 * 128 else -20
     r, g, b = (min(255, max(0, c + step)) for c in bg)
-    return f"\x1b[48;2;{r};{g};{b}m"
+    r2, g2, b2 = (min(255, max(0, c + 2 * step)) for c in bg)
+    return f"\x1b[48;2;{r};{g};{b}m", f"\x1b[48;2;{r2};{g2};{b2}m"
 
 
-def search_sessions(cwd: Path | None, pattern: str, max_hits: int = 3) -> int:
-    """List sessions whose title or transcript matches the regex pattern (case-insensitive)."""
-    try:
-        rx = re.compile(pattern, re.IGNORECASE)
-    except re.error as e:
-        print(f"Bad pattern {pattern!r}: {e}", file=sys.stderr)
-        return 1
-    color = sys.stdout.isatty()
-    shade = shade_code() if color else ""
-    rows = all_sessions(cwd)
-    cw = cwd_width(rows, cwd)
-    found = 0
-    for s in rows:
-        lines = [s.title] + [l for _, _, body in agent_of(s).transcript(s) for l in body.splitlines()]
-        hits = list(dict.fromkeys(snippet(l.strip(), m) for l in lines if (m := rx.search(l.strip()))))
-        if not hits:
-            continue
-        if not found:
-            print(header(cw))
-        found += 1
-        print(format_row(s, cw))
-        for h in hits[:max_hits]:
-            if color:
-                h = shade + rx.sub(lambda m: f"\x1b[1m{m[0]}\x1b[22m", h) + "\x1b[0m"
-            print(f"        │ {h}")
-        if len(hits) > max_hits:
-            print(f"        │ … {len(hits) - max_hits} more")
-        sys.stdout.flush()
-    if not found:
-        print(f"No sessions in {where(cwd)} match: {pattern}")
-        return 1
-    return 0
+def find_hits(s: Session, rx: re.Pattern) -> list[Hit]:
+    """Snippet, with the match span, of each distinct matching line in the session."""
+    lines = [s.title] + [l for _, _, body in agent_of(s).transcript(s) for l in body.splitlines()]
+    return list(dict.fromkeys(snippet(l.strip(), m) for l in lines if (m := rx.search(l.strip()))))
 
 
-def dump_session(cwd: Path | None, session_id: str, out_path: Path | None) -> int:
-    """Write a clean, readable dump of a session transcript.
+def dump_session(s: Session, out: Path) -> None:
+    """Write a clean, readable dump of a session transcript to out.
 
     Keeps real user-typed text, assistant text, and compact one-line tool
     markers. Drops thinking/reasoning and raw tool results. Groups
     consecutive assistant records into a single response block.
     """
-    s = next((s for s in all_sessions(cwd) if s.id == session_id), None)
-    if s is None:
-        print(f"Session not found: {session_id}", file=sys.stderr)
-        return 1
-    out = out_path or Path(f"{session_id}.txt")
-
     # Merge consecutive ASSISTANT turns into one block (keep first ts).
     merged = []
     for role, ts, body in agent_of(s).transcript(s):
@@ -570,13 +543,10 @@ def dump_session(cwd: Path | None, session_id: str, out_path: Path | None) -> in
             o.write(f"\n{'─'*6} [{ts}] {role} {'─'*6}\n{body}\n")
 
     print(f"{len(merged)} turns written to {out}")
-    return 0
 
 
-def ask_confirm(prompt: str, allow_back: bool) -> str:
-    """Read a one-key answer: 'yes', 'no', or 'back' (Esc, when allow_back)."""
-    if not sys.stdin.isatty():
-        return "yes" if input(prompt).strip().lower() == "y" else "no"
+def ask_confirm(prompt: str) -> str:
+    """Read a one-key answer: 'yes', 'no', or 'back' (Esc)."""
     out = sys.stdout
     out.write(prompt)
     out.flush()
@@ -593,47 +563,26 @@ def ask_confirm(prompt: str, allow_back: bool) -> str:
     out.flush()
     if key in ("y", "Y"):
         return "yes"
-    return "back" if key == "esc" and allow_back else "no"
+    return "back" if key == "esc" else "no"
 
 
-def confirm_remove(rows: list[Session], cwd: Path | None, allow_back: bool = False) -> str:
-    """Confirm then remove rows; returns 'removed', 'aborted', 'back' or 'clear'."""
+def confirm_remove(rows: list[Session], cwd: Path | None) -> str:
+    """Confirm then remove rows; returns 'removed', 'back' or 'clear'."""
     cw = cwd_width(rows, cwd)
     print(header(cw))
     for row in rows:
         print(format_row(row, cw))
-    hint = ", Esc back, n clears selection" if allow_back else ""
-    ans = ask_confirm(f"Remove {len(rows)} session(s) for {where(cwd)}? [y/N{hint}] ", allow_back)
+    ans = ask_confirm(
+        f"Remove {len(rows)} session(s) for {where(cwd)}? [y/N, Esc back, n clears selection] "
+    )
     if ans == "back":
         return "back"
-    if ans != "yes":
-        if allow_back:  # n/Enter: back to the picker, but with nothing selected
-            return "clear"
-        print("Aborted.")
-        return "aborted"
+    if ans != "yes":  # n/Enter: back to the picker, but with nothing selected
+        return "clear"
     for row in rows:
         agent_of(row).remove(row)
     print(f"Removed {len(rows)} session(s).")
     return "removed"
-
-
-def remove_matching(cwd: Path | None, patterns: list[str]) -> int:
-    """Each pattern is an id, an id prefix, or a glob ('*' = every session)."""
-    rows = all_sessions(cwd)
-    matched = []
-    for pat in patterns:
-        hits = [r for r in rows if fnmatch(r.id, pat) or r.id.startswith(pat)]
-        if not hits:
-            print(f"No sessions match: {pat}", file=sys.stderr)
-        matched += [h for h in hits if h not in matched]
-    if not matched:
-        return 1
-    if len(matched) == 1 and matched[0].id in patterns:
-        agent_of(matched[0]).remove(matched[0])
-        print(f"Removed {matched[0].agent} session {matched[0].id}")
-        return 0
-    confirm_remove(matched, cwd)
-    return 0
 
 
 def copy_to_clipboard(text: str) -> bool:
@@ -717,27 +666,97 @@ def read_key(fd: int) -> str | tuple[int, int, int]:
     }.get(seq, "")
 
 
-def pick_sessions(rows: list[Session], cw: int, marks: list[int] | None = None) -> list[int] | Session | None:
-    """Inline picker drawn below the cursor; returns the marked row indexes on r,
-    the session to resume on Enter, or None on q/Esc."""
+def pick_sessions(
+    rows: list[Session],
+    cw: int,
+    marks: list[int] | None = None,
+    hits: dict[tuple[str, str], list[Hit]] | None = None,
+    focus: Session | None = None,
+) -> tuple[str, list[int] | Session | str | None, Session] | None:
+    """Inline picker drawn below the cursor.
+
+    hits maps (agent, id) to matched snippets; when given, snippets are shown
+    under each session (all of them for the current or a marked row). focus is
+    the session to highlight on start. Returns (action, payload, current) where
+    action is 'remove'|'dump' (row indexes) on r/d, 'resume' (session) on Enter,
+    'search' (pattern) on / + Enter, 'back' (None) on Esc from a search page,
+    or None on q/Esc at the top level."""
     fd = sys.stdin.fileno()
     out = sys.stdout
     term = shutil.get_terminal_size()
     width = term.columns - 1
-    body = min(len(rows), max(1, term.lines - 3))
-    total = body + 2  # header + rows + footer
+    body = max(1, term.lines - 3)
+    total = body + 2  # header + body + footer
     cur = top = 0
     marks = list(marks or [])  # in mark order, so `u` undoes the latest
     if marks:  # resumed after Esc at the confirmation: start at the first mark
         cur = min(marks)
-        top = min(cur, max(0, len(rows) - body))
-    footer = "j/k move  Ctrl+f/b page  g/G top/bottom  Shift+j/k select  s toggle  u undo  y copy id  r remove  Enter resume  q/Esc cancel"
+    if focus is not None:  # resumes after backing out of dump/removal/search
+        cur = next(
+            (i for i, r in enumerate(rows) if (r.agent, r.id) == (focus.agent, focus.id)), cur
+        )
+    footer = "j/k move  / search  Ctrl+f/b page  g/G top/bottom  Shift+j/k select  s toggle  u undo  y copy id  d dump  r remove  Enter resume  q quit  Esc back"
     status = ""  # footer message, e.g. after yanking an id
-    shade = shade_code()
+    shade, match_shade = shade_codes()
     spans = header_spans(cw)
     cwd_span = next(((start, end) for start, end, attr, _ in spans if attr == "cwd"), None)
     sort_attr: str | None = None
     reverse = False
+
+    def content(i: int) -> list[Hit]:
+        """Matched snippets shown under row i: all when current or marked, else the first."""
+        if hits is None:
+            return []
+        found = hits.get((rows[i].agent, rows[i].id), [])
+        return found if i == cur or i in marks else found[:1]
+
+    def height(i: int) -> int:
+        return 1 + len(content(i))
+
+    def content_line(hit: Hit, current: bool, marked: bool) -> str:
+        """One snippet line, with the matched keyword in a second highlight colour."""
+        prefix = "        │ "
+        text, start, end = hit
+        text = text[:max(0, width - len(prefix))]
+        start, end = min(start, len(text)), min(end, len(text))
+        if start < end and current:  # inside reverse video: step out for the keyword
+            text = f"{text[:start]}\x1b[27m{match_shade}{text[start:end]}\x1b[0m\x1b[7m{text[end:]}"
+        elif start < end and marked:
+            text = f"{text[:start]}{match_shade}{text[start:end]}\x1b[0m{shade}{text[end:]}"
+        return prefix + text
+
+    def frame(footer_line: str) -> list[tuple[int, bool]]:
+        """Draw a frame; returns (row index, is the session row) for each body line."""
+        nonlocal top
+        if cur < top:
+            top = cur
+        while top < cur and sum(height(i) for i in range(top, cur + 1)) > body:
+            top += 1
+        lines = [f"\x1b[1m   {header(cw)}\x1b[0m"]
+        row_map = []
+        used = 0
+        i = top
+        while i < len(rows) and used < body:
+            current = i == cur
+            marked = i in marks
+            entry = [f"   {format_row(rows[i], cw)}"[:width]] + [
+                content_line(h, current, marked) for h in content(i)
+            ]
+            entry = entry[:body - used]
+            for j, line in enumerate(entry):
+                if current:
+                    line = f"\x1b[7m{line}\x1b[0m"
+                elif marked:
+                    line = f"{shade}{line}\x1b[0m"
+                lines.append(line)
+                row_map.append((i, j == 0))
+            used += len(entry)
+            i += 1
+        lines.append(footer_line[:width])
+        lines += [""] * (total - len(lines))
+        out.write("".join(f"\r\x1b[K{line}\n" for line in lines) + f"\x1b[{total}A")
+        out.flush()
+        return row_map
 
     old = termios.tcgetattr(fd)
     tty.setcbreak(fd)
@@ -754,22 +773,7 @@ def pick_sessions(rows: list[Session], cw: int, marks: list[int] | None = None) 
             out.write("\x1b[?1000h\x1b[?1006h")  # report clicks in SGR form
             mouse = True
         while True:
-            if cur < top:
-                top = cur
-            elif cur >= top + body:
-                top = cur - body + 1
-            lines = [f"\x1b[1m   {header(cw)}\x1b[0m"]
-            for i in range(top, top + body):
-                line = f"   {format_row(rows[i], cw)}"[:width]
-                if i == cur:
-                    lines.append(f"\x1b[7m{line}\x1b[0m")
-                elif i in marks:
-                    lines.append(f"{shade}{line}\x1b[0m")
-                else:
-                    lines.append(line)
-            lines.append(status or footer)
-            out.write("".join(f"\r\x1b[K{line}\n" for line in lines) + f"\x1b[{total}A")
-            out.flush()
+            row_map = frame(status or footer)
             key = read_key(fd)
             status = ""
             if isinstance(key, tuple):
@@ -790,9 +794,10 @@ def pick_sessions(rows: list[Session], cw: int, marks: list[int] | None = None) 
                     marks = [i for i, r in enumerate(rows) if any(r is m for m in marked)]
                     cur = next((i for i, r in enumerate(rows) if r is here), 0)
                     status = f"Sorted by {label} {'desc' if reverse else 'asc'}"
-                elif button == 0 and 0 <= row < body:
-                    s = rows[top + row]
-                    if cwd_span and s.cwd and 3 + cwd_span[0] <= col < 3 + cwd_span[1]:
+                elif button == 0 and 0 <= row < len(row_map):
+                    cur, on_session_row = row_map[row]
+                    s = rows[cur]
+                    if on_session_row and cwd_span and s.cwd and 3 + cwd_span[0] <= col < 3 + cwd_span[1]:
                         target = s.cwd
                     else:
                         target = str(s.path.parent)
@@ -827,10 +832,31 @@ def pick_sessions(rows: list[Session], cw: int, marks: list[int] | None = None) 
             elif key == "y":
                 sid = rows[cur].id
                 status = f"Copied {sid}" if copy_to_clipboard(sid) else f"OSC 52 only: {sid}"
+            elif key == "/":
+                pattern = ""
+                while True:
+                    frame(f"/{pattern}")
+                    key = read_key(fd)
+                    if key in ("\r", "\n"):
+                        if pattern:
+                            return "search", pattern, rows[cur]
+                        break
+                    if key in ("esc", "\x0f"):  # Ctrl+O
+                        break
+                    if key in ("\x7f", "\b"):
+                        pattern = pattern[:-1]
+                    elif key == "\x15":  # Ctrl+U
+                        pattern = ""
+                    elif isinstance(key, str) and len(key) == 1 and key.isprintable():
+                        pattern += key
+            elif key == "d":
+                return "dump", marks or [cur], rows[cur]
             elif key == "r":
-                return marks
+                return "remove", marks or [cur], rows[cur]
             elif key in ("\r", "\n"):
-                return rows[cur]
+                return "resume", rows[cur], rows[cur]
+            elif key == "esc" and hits is not None:
+                return "back", None, rows[cur]
             elif key in ("q", "esc"):
                 return None
     except KeyboardInterrupt:
@@ -852,6 +878,76 @@ def resume_session(s: Session) -> int:
     return 0
 
 
+def prompt_name(prompt: str, default: str) -> str | None:
+    """Read a filename prefilled with default; None if Esc or Ctrl+O backs out."""
+    out = sys.stdout
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    tty.setcbreak(fd)
+    buf = default
+    try:
+        while True:
+            out.write(f"\r\x1b[K{prompt}{buf}")
+            out.flush()
+            key = read_key(fd)
+            if key in ("\r", "\n"):
+                return buf.strip() or default
+            if key in ("esc", "\x0f"):  # Ctrl+O
+                return None
+            if key in ("\x7f", "\b"):
+                buf = buf[:-1]
+            elif key == "\x15":  # Ctrl+U
+                buf = ""
+            elif isinstance(key, str) and len(key) == 1 and key.isprintable():
+                buf += key
+    except KeyboardInterrupt:
+        return None
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        out.write("\r\x1b[K")
+        out.flush()
+
+
+def ask_enter(prompt: str) -> bool:
+    """Wait for Enter (True); Esc, Ctrl+O or Ctrl+C backs out (False)."""
+    out = sys.stdout
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    tty.setcbreak(fd)
+    try:
+        out.write(prompt)
+        out.flush()
+        while True:
+            key = read_key(fd)
+            if key in ("\r", "\n"):
+                return True
+            if key in ("esc", "\x0f"):  # Ctrl+O
+                return False
+    except KeyboardInterrupt:
+        return False
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        out.write("\r\x1b[K")
+        out.flush()
+
+
+def dump_selected(rows: list[Session]) -> bool:
+    """Dump sessions into the current directory; False if the prompt was backed out of."""
+    if len(rows) == 1:
+        name = prompt_name("Dump as: ", f"{rows[0].id}.txt")
+        if name is None:
+            return False
+        dump_session(rows[0], Path(name))
+        return True
+    if not ask_enter(
+        f"Dump {len(rows)} sessions as <session-id>_dump.txt each? [Enter dump, Esc/Ctrl+O back] "
+    ):
+        return False
+    for s in rows:
+        dump_session(s, Path(f"{s.id}_dump.txt"))
+    return True
+
+
 def interactive_menu(cwd: Path | None) -> int:
     if not sys.stdin.isatty():
         print("The interactive menu needs a terminal; pass -l to list sessions.", file=sys.stderr)
@@ -862,30 +958,67 @@ def interactive_menu(cwd: Path | None) -> int:
         return 0
     cw = cwd_width(rows, cwd)
     marks: list[int] = []
+    hits: dict[tuple[str, str], list[Hit]] | None = None
+    filters: list[re.Pattern] = []
+    history: list[tuple[
+        list[Session], dict[tuple[str, str], list[Hit]] | None, int, list[re.Pattern], list[int]
+    ]] = []
+    focus: Session | None = None
     while True:
-        action = pick_sessions(rows, cw, marks)
+        action = pick_sessions(rows, cw, marks, hits, focus)
         if action is None:
             print("Cancelled.")
             return 0
-        if isinstance(action, Session):
-            return resume_session(action)
-        picked = action
-        if not picked:
-            print("Nothing selected.")
-            return 0
-        result = confirm_remove([rows[i] for i in sorted(picked)], cwd, allow_back=True)
+        kind, payload, focus = action
+        if kind == "back":  # Esc on a search page: back to the page searched from
+            if history:
+                rows, hits, cw, filters, marks = history.pop()
+            else:  # no page left (e.g. after a removal): drop all filters
+                rows = all_sessions(cwd)
+                hits, filters, marks = None, [], []
+                cw = cwd_width(rows, cwd)
+            continue
+        if kind == "search":
+            try:
+                rx = re.compile(payload, re.IGNORECASE)
+            except re.error as e:
+                print(f"Bad pattern {payload!r}: {e}")
+                continue
+            found = [(s, h) for s in rows if (h := find_hits(s, rx))]
+            if not found:
+                print(f"No sessions match: {payload}")
+                continue
+            history.append((rows, hits, cw, list(filters), list(marks)))
+            filters = filters + [rx]
+            rows = [s for s, _ in found]
+            hits = {(s.agent, s.id): h for s, h in found}
+            cw = cwd_width(rows, cwd)
+            marks = []
+            continue
+        if isinstance(payload, Session):
+            return resume_session(payload)
+        targets = [rows[i] for i in sorted(payload)]
+        if kind == "dump":
+            if not dump_selected(targets):  # cancelled at the name prompt
+                continue
+            marks = []
+            continue
+        result = confirm_remove(targets, cwd)
         if result == "back":
-            marks = picked  # Esc at the confirmation: back to the picker, selection kept
+            marks = payload  # Esc at the confirmation: back to the picker, selection kept
             continue
         if result == "clear":
             marks = []  # n at the confirmation: back, but with nothing selected
             continue
-        if result == "aborted":
-            return 0
         # Removed: pick again from what is left instead of exiting.
+        history = []  # its pages may point at removed sessions
         rows = all_sessions(cwd)
+        rows = [s for s in rows if all(find_hits(s, rx) for rx in filters)]
+        hits = (
+            {(s.agent, s.id): find_hits(s, filters[-1]) for s in rows} if filters else None
+        )
         if not rows:
-            print(f"No sessions left for {where(cwd)}")
+            print("No matching sessions left." if filters else f"No sessions left for {where(cwd)}")
             return 0
         cw = cwd_width(rows, cwd)
         marks = []
@@ -895,43 +1028,17 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="List, search, remove, dump or resume "
         + "/".join(a.name for a in AGENTS)
-        + " sessions for the current working directory (or every directory with -a); "
-        "with no arguments, open the interactive menu.",
+        + " sessions; with no arguments, open the interactive menu "
+        "(-l lists them, -a includes every directory).",
     )
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("-l", "--list", dest="l", action="store_true", help="list sessions for $PWD")
-    group.add_argument(
-        "-r",
-        "--remove",
-        dest="r",
-        metavar="PATTERN",
-        nargs="*",
-        help="remove sessions matching id/prefix/glob ('*' = all, quote it); "
-        "with no argument, pick interactively",
-    )
-    group.add_argument(
-        "-d",
-        "--dump",
-        dest="d",
-        metavar="SESSION_ID",
-        help="dump a session's conversation to SESSION_ID.txt (or -o FILE)",
-    )
-    group.add_argument(
-        "-s",
-        "--search",
-        metavar="REGEX",
-        help="list sessions whose title or conversation matches REGEX (case-insensitive)",
+    parser.add_argument(
+        "-l", "--list", dest="l", action="store_true", help="list sessions for $PWD"
     )
     parser.add_argument(
         "-a",
         "--all",
         action="store_true",
-        help="apply -l/-r/-d/-s to sessions in every directory, not just $PWD",
-    )
-    parser.add_argument(
-        "-o",
-        metavar="FILE",
-        help="output file for -d (default: SESSION_ID.txt in the current dir)",
+        help="apply -l to sessions in every directory, not just $PWD",
     )
     if not sys.argv[1:]:
         return interactive_menu(Path(os.getcwd()).resolve())
@@ -941,18 +1048,7 @@ def main() -> int:
         return list_sessions(None)
 
     args = parser.parse_args()
-    cwd = None if args.all else Path(os.getcwd()).resolve()
-
-    if args.l:
-        return list_sessions(cwd)
-    if args.search is not None:
-        return search_sessions(cwd, args.search)
-    if args.d:
-        out_path = Path(args.o) if args.o else None
-        return dump_session(cwd, args.d, out_path)
-    if args.r:
-        return remove_matching(cwd, args.r)
-    return interactive_menu(cwd)
+    return list_sessions(None if args.all else Path(os.getcwd()).resolve())
 
 
 if __name__ == "__main__":
