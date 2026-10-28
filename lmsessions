@@ -577,16 +577,18 @@ def ask_confirm(prompt: str, allow_back: bool) -> str:
 
 
 def confirm_remove(rows: list[Session], cwd: Path | None, allow_back: bool = False) -> str:
-    """Confirm then remove rows; returns 'removed', 'aborted' or 'back'."""
+    """Confirm then remove rows; returns 'removed', 'aborted', 'back' or 'clear'."""
     cw = cwd_width(rows, cwd)
     print(header(cw))
     for row in rows:
         print(format_row(row, cw))
-    hint = ", Esc back" if allow_back else ""
+    hint = ", Esc back, n clears selection" if allow_back else ""
     ans = ask_confirm(f"Remove {len(rows)} session(s) for {where(cwd)}? [y/N{hint}] ", allow_back)
     if ans == "back":
         return "back"
     if ans != "yes":
+        if allow_back:  # n/Enter: back to the picker, but with nothing selected
+            return "clear"
         print("Aborted.")
         return "aborted"
     for row in rows:
@@ -706,8 +708,9 @@ def pick_sessions(rows: list[Session], cw: int, marks: list[int] | None = None) 
     cur = top = 0
     marks = list(marks or [])  # in mark order, so `u` undoes the latest
     if marks:  # resumed after Esc at the confirmation: start at the first mark
-        cur = top = min(marks)
-    footer = "j/k move  Ctrl+f/b page  Shift+j/k select  d toggle  u undo  y copy id  Enter confirm  q/Esc cancel"
+        cur = min(marks)
+        top = min(cur, max(0, len(rows) - body))
+    footer = "j/k move  Ctrl+f/b page  g/G top/bottom  Shift+j/k select  d toggle  u undo  y copy id  Enter confirm  q/Esc cancel"
     status = ""  # footer message, e.g. after yanking an id
     spans = header_spans(cw)
     sort_attr: str | None = None
@@ -767,6 +770,10 @@ def pick_sessions(rows: list[Session], cw: int, marks: list[int] | None = None) 
                 cur = min(cur + body, len(rows) - 1)
             elif key == "\x02":  # Ctrl+b
                 cur = max(cur - body, 0)
+            elif key == "g":
+                cur = 0
+            elif key == "G":
+                cur = len(rows) - 1
             elif key in ("J", "K", "shift-down", "shift-up"):
                 step = 1 if key in ("J", "shift-down") else -1
                 prev, cur = cur, min(max(cur + step, 0), len(rows) - 1)
@@ -819,6 +826,9 @@ def interactive_remove(cwd: Path | None) -> int:
         result = confirm_remove([rows[i] for i in sorted(picked)], cwd, allow_back=True)
         if result == "back":
             marks = picked  # Esc at the confirmation: back to the picker, selection kept
+            continue
+        if result == "clear":
+            marks = []  # n at the confirmation: back, but with nothing selected
             continue
         if result == "aborted":
             return 0
