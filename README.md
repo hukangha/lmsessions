@@ -1,5 +1,6 @@
 # lmsessions
 
-List, search, remove or dump Claude Code, Codex and OpenCode sessions.
+List, search, remove, dump or resume Claude Code, Codex and OpenCode sessions.
+Run with no arguments for the interactive menu.
 
 Requires Python 3.10+

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""List, search, remove or dump coding-agent sessions (Claude Code, Codex,
-OpenCode) for the current working directory, or for every directory with -a.
+"""List, search, remove, dump or resume coding-agent sessions (Claude Code,
+Codex, OpenCode) for the current working directory, or for every directory with
+-a. With no arguments, open the interactive menu.
 
 To support another agent, subclass `Agent` and add an instance to `AGENTS`.
 """
@@ -69,6 +70,13 @@ def tool_marker(name: str, inp: dict) -> str:
     return f"    → {name}"
 
 
+def exec_agent(s: Session, argv: list[str]) -> None:
+    """Replace this process with the agent tool, continuing session s in its directory."""
+    if s.cwd and Path(s.cwd).is_dir():
+        os.chdir(s.cwd)
+    os.execvp(argv[0], argv)
+
+
 class Agent:
     name: str
 
@@ -77,6 +85,9 @@ class Agent:
         raise NotImplementedError
 
     def remove(self, s: Session) -> None:
+        raise NotImplementedError
+
+    def resume(self, s: Session) -> None:
         raise NotImplementedError
 
     def transcript(self, s: Session) -> list[Turn]:
@@ -135,6 +146,9 @@ class ClaudeAgent(Agent):
 
     def remove(self, s: Session) -> None:
         s.path.unlink()
+
+    def resume(self, s: Session) -> None:
+        exec_agent(s, ["claude", "--resume", s.id])
 
     def transcript(self, s: Session) -> list[Turn]:
         turns = []
@@ -238,6 +252,9 @@ class CodexAgent(Agent):
             conn.close()
         s.path.unlink(missing_ok=True)
 
+    def resume(self, s: Session) -> None:
+        exec_agent(s, ["codex", "resume", s.id])
+
     def transcript(self, s: Session) -> list[Turn]:
         if not s.path.is_file():
             return []
@@ -323,6 +340,9 @@ class OpenCodeAgent(Agent):
             conn.commit()
         finally:
             conn.close()
+
+    def resume(self, s: Session) -> None:
+        exec_agent(s, ["opencode", "--session", s.id])
 
     def transcript(self, s: Session) -> list[Turn]:
         if not self.db.is_file():
@@ -697,8 +717,9 @@ def read_key(fd: int) -> str | tuple[int, int, int]:
     }.get(seq, "")
 
 
-def pick_sessions(rows: list[Session], cw: int, marks: list[int] | None = None) -> list[int] | None:
-    """Inline picker drawn below the cursor; returns marked row indexes, or None on q/Esc."""
+def pick_sessions(rows: list[Session], cw: int, marks: list[int] | None = None) -> list[int] | Session | None:
+    """Inline picker drawn below the cursor; returns the marked row indexes on r,
+    the session to resume on Enter, or None on q/Esc."""
     fd = sys.stdin.fileno()
     out = sys.stdout
     term = shutil.get_terminal_size()
@@ -710,9 +731,11 @@ def pick_sessions(rows: list[Session], cw: int, marks: list[int] | None = None) 
     if marks:  # resumed after Esc at the confirmation: start at the first mark
         cur = min(marks)
         top = min(cur, max(0, len(rows) - body))
-    footer = "j/k move  Ctrl+f/b page  g/G top/bottom  Shift+j/k select  d toggle  u undo  y copy id  Enter confirm  q/Esc cancel"
+    footer = "j/k move  Ctrl+f/b page  g/G top/bottom  Shift+j/k select  s toggle  u undo  y copy id  r remove  Enter resume  q/Esc cancel"
     status = ""  # footer message, e.g. after yanking an id
+    shade = shade_code()
     spans = header_spans(cw)
+    cwd_span = next(((start, end) for start, end, attr, _ in spans if attr == "cwd"), None)
     sort_attr: str | None = None
     reverse = False
 
@@ -737,9 +760,13 @@ def pick_sessions(rows: list[Session], cw: int, marks: list[int] | None = None) 
                 top = cur - body + 1
             lines = [f"\x1b[1m   {header(cw)}\x1b[0m"]
             for i in range(top, top + body):
-                mark = "D" if i in marks else " "
-                line = f" {mark} {format_row(rows[i], cw)}"[:width]
-                lines.append(f"\x1b[7m{line}\x1b[0m" if i == cur else line)
+                line = f"   {format_row(rows[i], cw)}"[:width]
+                if i == cur:
+                    lines.append(f"\x1b[7m{line}\x1b[0m")
+                elif i in marks:
+                    lines.append(f"{shade}{line}\x1b[0m")
+                else:
+                    lines.append(line)
             lines.append(status or footer)
             out.write("".join(f"\r\x1b[K{line}\n" for line in lines) + f"\x1b[{total}A")
             out.flush()
@@ -747,8 +774,10 @@ def pick_sessions(rows: list[Session], cw: int, marks: list[int] | None = None) 
             status = ""
             if isinstance(key, tuple):
                 button, x, y = key
+                col = x - 1  # 0-based screen column; the rows start three chars in
+                row = y - picker_top - 1 if picker_top is not None else -1
                 hit = next(((attr, label) for start, end, attr, label in spans
-                            if 3 + start <= x - 1 < 3 + end), None)
+                            if 3 + start <= col < 3 + end), None)
                 if button == 0 and y == picker_top and hit:
                     attr, label = hit
                     if attr == sort_attr:
@@ -761,6 +790,13 @@ def pick_sessions(rows: list[Session], cw: int, marks: list[int] | None = None) 
                     marks = [i for i, r in enumerate(rows) if any(r is m for m in marked)]
                     cur = next((i for i, r in enumerate(rows) if r is here), 0)
                     status = f"Sorted by {label} {'desc' if reverse else 'asc'}"
+                elif button == 0 and 0 <= row < body:
+                    s = rows[top + row]
+                    if cwd_span and s.cwd and 3 + cwd_span[0] <= col < 3 + cwd_span[1]:
+                        target = s.cwd
+                    else:
+                        target = str(s.path.parent)
+                    status = f"Copied {target}" if copy_to_clipboard(target) else f"OSC 52 only: {target}"
                 continue
             if key in ("j", "down"):
                 cur = min(cur + 1, len(rows) - 1)
@@ -780,7 +816,7 @@ def pick_sessions(rows: list[Session], cw: int, marks: list[int] | None = None) 
                 for i in (prev, cur):  # extend the selection over both ends
                     if i not in marks:
                         marks.append(i)
-            elif key == "d":
+            elif key == "s":
                 if cur in marks:
                     marks.remove(cur)
                 else:
@@ -791,8 +827,10 @@ def pick_sessions(rows: list[Session], cw: int, marks: list[int] | None = None) 
             elif key == "y":
                 sid = rows[cur].id
                 status = f"Copied {sid}" if copy_to_clipboard(sid) else f"OSC 52 only: {sid}"
-            elif key in ("\r", "\n"):
+            elif key == "r":
                 return marks
+            elif key in ("\r", "\n"):
+                return rows[cur]
             elif key in ("q", "esc"):
                 return None
     except KeyboardInterrupt:
@@ -805,9 +843,18 @@ def pick_sessions(rows: list[Session], cw: int, marks: list[int] | None = None) 
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 
-def interactive_remove(cwd: Path | None) -> int:
+def resume_session(s: Session) -> int:
+    try:
+        agent_of(s).resume(s)
+    except OSError as e:
+        print(f"Cannot resume {s.agent} session {s.id}: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def interactive_menu(cwd: Path | None) -> int:
     if not sys.stdin.isatty():
-        print("Interactive removal needs a terminal; pass a pattern to -r.", file=sys.stderr)
+        print("The interactive menu needs a terminal; pass -l to list sessions.", file=sys.stderr)
         return 1
     rows = all_sessions(cwd)
     if not rows:
@@ -816,10 +863,13 @@ def interactive_remove(cwd: Path | None) -> int:
     cw = cwd_width(rows, cwd)
     marks: list[int] = []
     while True:
-        picked = pick_sessions(rows, cw, marks)
-        if picked is None:
+        action = pick_sessions(rows, cw, marks)
+        if action is None:
             print("Cancelled.")
             return 0
+        if isinstance(action, Session):
+            return resume_session(action)
+        picked = action
         if not picked:
             print("Nothing selected.")
             return 0
@@ -843,9 +893,10 @@ def interactive_remove(cwd: Path | None) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="List, search, remove or dump "
+        description="List, search, remove, dump or resume "
         + "/".join(a.name for a in AGENTS)
-        + " sessions for the current working directory (or every directory with -a).",
+        + " sessions for the current working directory (or every directory with -a); "
+        "with no arguments, open the interactive menu.",
     )
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("-l", "--list", dest="l", action="store_true", help="list sessions for $PWD")
@@ -882,10 +933,12 @@ def main() -> int:
         metavar="FILE",
         help="output file for -d (default: SESSION_ID.txt in the current dir)",
     )
+    if not sys.argv[1:]:
+        return interactive_menu(Path(os.getcwd()).resolve())
     if set(sys.argv[1:]) <= {"-a", "--all"}:
         parser.print_usage()
         print()
-        return list_sessions(None if sys.argv[1:] else Path(os.getcwd()).resolve())
+        return list_sessions(None)
 
     args = parser.parse_args()
     cwd = None if args.all else Path(os.getcwd()).resolve()
@@ -899,7 +952,7 @@ def main() -> int:
         return dump_session(cwd, args.d, out_path)
     if args.r:
         return remove_matching(cwd, args.r)
-    return interactive_remove(cwd)
+    return interactive_menu(cwd)
 
 
 if __name__ == "__main__":
