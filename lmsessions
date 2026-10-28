@@ -13,6 +13,7 @@ import re
 import select
 import shutil
 import sqlite3
+import subprocess
 import sys
 import termios
 import tty
@@ -113,16 +114,23 @@ class ClaudeAgent(Agent):
 
     @staticmethod
     def title_and_cwd(path: Path) -> tuple[str, str]:
-        """Latest title (a /rename custom title wins over the AI one) and the session's cwd."""
-        custom = ai = cwd = ""
+        """Latest title (a /rename custom title wins over the AI one), or the first
+        user message when the session has neither, plus the session's cwd."""
+        custom = ai = cwd = first = ""
         for entry in read_jsonl(path):
             typ = entry.get("type")
             if typ == "custom-title":
                 custom = entry.get("customTitle", "") or custom
             elif typ == "ai-title":
                 ai = entry.get("aiTitle", "") or ai
+            elif typ == "user" and not first:
+                text = " ".join(ClaudeAgent.user_text(entry.get("message") or {}).split())
+                # Skip the synthetic records Claude Code writes for slash commands.
+                if text and not text.startswith(("<local-command", "<command-name", "<command-message")):
+                    first = text
             cwd = cwd or entry.get("cwd", "")
-        return custom or ai, cwd
+        title = custom or ai or (first[:60] + "…" if len(first) > 60 else first)
+        return title, cwd
 
     def remove(self, s: Session) -> None:
         s.path.unlink()
@@ -563,10 +571,32 @@ def remove_matching(cwd: Path | None, patterns: list[str]) -> int:
     return 0
 
 
-def copy_to_clipboard(text: str) -> None:
-    """Copy text with the OSC 52 escape, which needs no external tools and works over SSH."""
-    sys.stdout.write(f"\x1b]52;c;{base64.b64encode(text.encode()).decode()}\x07")
-    sys.stdout.flush()
+def copy_to_clipboard(text: str) -> bool:
+    """Put text on the system clipboard; True if a native tool (not just the terminal) took it.
+
+    Prefers wl-copy/xclip/xsel, setting both CLIPBOARD and PRIMARY since
+    Shift+Insert pastes either depending on the terminal. Falls back to OSC 52,
+    which works over SSH but is ignored by some terminals (e.g. Konsole 23.08).
+    """
+    if os.environ.get("WAYLAND_DISPLAY") and shutil.which("wl-copy"):
+        cmds = (["wl-copy"], ["wl-copy", "--primary"])
+    elif os.environ.get("DISPLAY") and shutil.which("xclip"):
+        cmds = (["xclip", "-selection", "clipboard"], ["xclip", "-selection", "primary"])
+    elif os.environ.get("DISPLAY") and shutil.which("xsel"):
+        cmds = (["xsel", "--clipboard", "--input"], ["xsel", "--primary", "--input"])
+    else:
+        cmds = ()
+    native = False
+    for cmd in cmds:
+        try:
+            subprocess.run(cmd, input=text.encode(), check=True, timeout=5)
+            native = True
+        except (OSError, subprocess.SubprocessError):
+            continue
+    if not native:
+        sys.stdout.write(f"\x1b]52;c;{base64.b64encode(text.encode()).decode()}\x07")
+        sys.stdout.flush()
+    return native
 
 
 def read_key(fd: int) -> str:
@@ -597,7 +627,7 @@ def pick_sessions(rows: list[Session], cw: int, marks: list[int] | None = None) 
     marks = list(marks or [])  # in mark order, so `u` undoes the latest
     if marks:  # resumed after Esc at the confirmation: start at the first mark
         cur = top = min(marks)
-    footer = "j/k move  Ctrl+f/b page  Shift+↑/↓ select  d toggle  u undo  y copy id  Enter confirm  q/Esc cancel"
+    footer = "j/k move  Ctrl+f/b page  Shift+j/k select  d toggle  u undo  y copy id  Enter confirm  q/Esc cancel"
     status = ""  # one-frame footer message, e.g. after yanking an id
 
     old = termios.tcgetattr(fd)
@@ -629,8 +659,9 @@ def pick_sessions(rows: list[Session], cw: int, marks: list[int] | None = None) 
                 cur = min(cur + body, len(rows) - 1)
             elif key == "\x02":  # Ctrl+b
                 cur = max(cur - body, 0)
-            elif key in ("shift-down", "shift-up"):
-                prev, cur = cur, min(max(cur + (1 if key == "shift-down" else -1), 0), len(rows) - 1)
+            elif key in ("J", "K", "shift-down", "shift-up"):
+                step = 1 if key in ("J", "shift-down") else -1
+                prev, cur = cur, min(max(cur + step, 0), len(rows) - 1)
                 for i in (prev, cur):  # extend the selection over both ends
                     if i not in marks:
                         marks.append(i)
@@ -643,8 +674,8 @@ def pick_sessions(rows: list[Session], cw: int, marks: list[int] | None = None) 
                 if marks:
                     marks.pop()
             elif key == "y":
-                copy_to_clipboard(rows[cur].id)
-                status = f"Copied {rows[cur].id}"
+                sid = rows[cur].id
+                status = f"Copied {sid}" if copy_to_clipboard(sid) else f"OSC 52 only: {sid}"
             elif key in ("\r", "\n"):
                 return marks
             elif key in ("q", "esc"):
