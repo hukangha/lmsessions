@@ -555,7 +555,7 @@ def pick_sessions(rows: list[Session], cw: int) -> list[int] | None:
     total = body + 2  # header + rows + footer
     cur = top = 0
     marks: list[int] = []  # in mark order, so `u` undoes the latest
-    footer = "j/k move   d mark   u undo   Enter confirm   q/Esc cancel"
+    footer = "j/k move   Ctrl+f/b page   d mark   u undo   Enter confirm   q/Esc cancel"
 
     old = termios.tcgetattr(fd)
     tty.setcbreak(fd)
@@ -581,6 +581,10 @@ def pick_sessions(rows: list[Session], cw: int) -> list[int] | None:
                 cur = min(cur + 1, len(rows) - 1)
             elif key in ("k", "up"):
                 cur = max(cur - 1, 0)
+            elif key == "\x06":  # Ctrl+f
+                cur = min(cur + body, len(rows) - 1)
+            elif key == "\x02":  # Ctrl+b
+                cur = max(cur - body, 0)
             elif key == "d":
                 if cur not in marks:
                     marks.append(cur)
