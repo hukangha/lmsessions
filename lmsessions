@@ -393,9 +393,41 @@ def cwd_width(rows: list[Session], cwd: Path | None) -> int:
     return max((len(r.cwd) for r in rows), default=0) if cwd is None else 0
 
 
+COLUMNS = (
+    ("AGENT", AGENT_WIDTH, "agent", "<"),
+    ("SESSION ID", 38, "id", "<"),
+    ("MODIFIED", 19, "mtime", "<"),
+    ("SIZE", 10, "size", ">"),
+    ("PROMPTS", 7, "prompts", ">"),
+)
+
+
+def columns(cw: int = 0) -> list[tuple[str, int, str, str]]:
+    """(label, width, sort attribute, alignment) of the header columns, CWD last when shown."""
+    return list(COLUMNS) + ([("CWD", cw, "cwd", "<")] if cw else [])
+
+
 def header(cw: int = 0) -> str:
-    col = f"{'CWD':{cw}}  " if cw else ""
-    return f"{'AGENT':{AGENT_WIDTH}}  {'SESSION ID':38}  {'MODIFIED':19}  {'SIZE':>10}  {'PROMPTS':>7}  {col}TITLE"
+    parts = [f"{label:{align}{width}}" for label, width, _, align in columns(cw)]
+    return "  ".join(parts) + "  TITLE"
+
+
+def header_spans(cw: int = 0) -> list[tuple[int, int, str, str]]:
+    """(start, end, sort attribute, label) of each clickable header column."""
+    spans, x = [], 0
+    for label, width, attr, _ in columns(cw):
+        spans.append((x, x + width, attr, label))
+        x += width + 2
+    spans.append((x, 1 << 30, "title", "TITLE"))
+    return spans
+
+
+def sort_key(attr: str):
+    """Sort key for a column; text sorts case-insensitively."""
+    def key(s: Session):
+        v = getattr(s, attr)
+        return v.lower() if isinstance(v, str) else v
+    return key
 
 
 def agent_of(s: Session) -> Agent:
@@ -610,20 +642,57 @@ def copy_to_clipboard(text: str) -> bool:
     return native
 
 
-def read_key(fd: int) -> str:
-    ch = os.read(fd, 1)
+_pending = b""  # input bytes cursor_row read while waiting for the terminal's reply
+
+
+def read_byte(fd: int) -> bytes:
+    global _pending
+    if _pending:
+        byte, _pending = _pending[:1], _pending[1:]
+        return byte
+    return os.read(fd, 1)
+
+
+def cursor_row(fd: int) -> int | None:
+    """The terminal's cursor row (1-based), asked for with DSR; None if it doesn't answer."""
+    global _pending
+    sys.stdout.write("\x1b[6n")
+    sys.stdout.flush()
+    reply = b""
+    while len(reply) < 24 and select.select([fd], [], [], 0.2)[0]:
+        reply += os.read(fd, 1)
+        if re.search(rb"\x1b\[(\d+);\d+R", reply):
+            break
+    m = re.search(rb"\x1b\[(\d+);\d+R", reply)
+    if m is None:
+        _pending += reply  # keys typed while we waited: give them back
+        return None
+    _pending += reply[:m.start()] + reply[m.end():]
+    return int(m.group(1))
+
+
+def read_key(fd: int) -> str | tuple[int, int, int]:
+    ch = read_byte(fd)
     if ch != b"\x1b":
         return ch.decode(errors="replace")
-    # A bare Esc has nothing following it; arrow keys arrive as ESC [ A / ESC O A,
-    # and Shift+arrows as ESC [ 1 ; 2 A / B (xterm) or ESC [ a / b (rxvt).
-    if select.select([fd], [], [], 0.025)[0]:
-        seq = os.read(fd, 8)
-        return {
-            b"[A": "up", b"OA": "up", b"[B": "down", b"OB": "down",
-            b"[1;2A": "shift-up", b"[1;2B": "shift-down",
-            b"[a": "shift-up", b"[b": "shift-down",
-        }.get(seq, "")
-    return "esc"
+    # A bare Esc has nothing following it; keys arrive as CSI/SS3 sequences:
+    # ESC [ A / ESC O A (up), ESC [ 1 ; 2 A (shift-up), ESC [ a (rxvt shift-up),
+    # ESC [ < button ; x ; y M (SGR mouse press).
+    seq = b""
+    while _pending or select.select([fd], [], [], 0.025)[0]:
+        seq += read_byte(fd)
+        if len(seq) > 1 and seq[-1:] in b"ABMmab~":
+            break
+    if not seq:
+        return "esc"
+    mouse = re.fullmatch(rb"\[<(\d+);(\d+);(\d+)M", seq)
+    if mouse:
+        return int(mouse.group(1)), int(mouse.group(2)), int(mouse.group(3))
+    return {
+        b"[A": "up", b"OA": "up", b"[B": "down", b"OB": "down",
+        b"[1;2A": "shift-up", b"[1;2B": "shift-down",
+        b"[a": "shift-up", b"[b": "shift-down",
+    }.get(seq, "")
 
 
 def pick_sessions(rows: list[Session], cw: int, marks: list[int] | None = None) -> list[int] | None:
@@ -639,14 +708,25 @@ def pick_sessions(rows: list[Session], cw: int, marks: list[int] | None = None) 
     if marks:  # resumed after Esc at the confirmation: start at the first mark
         cur = top = min(marks)
     footer = "j/k move  Ctrl+f/b page  Shift+j/k select  d toggle  u undo  y copy id  Enter confirm  q/Esc cancel"
-    status = ""  # one-frame footer message, e.g. after yanking an id
+    status = ""  # footer message, e.g. after yanking an id
+    spans = header_spans(cw)
+    sort_attr: str | None = None
+    reverse = False
 
     old = termios.tcgetattr(fd)
     tty.setcbreak(fd)
     # Autowrap off: a line wider than the terminal would take two rows and
     # break the fixed cursor-up count, leaving stale lines behind.
     out.write("\x1b[?7l" + "\n" * total + f"\x1b[{total}A")  # make room below the cursor
+    out.flush()
+    picker_top = None
+    mouse = False
     try:
+        # Clicks arrive with absolute coordinates, so remember the header row.
+        picker_top = cursor_row(fd)
+        if picker_top is not None:
+            out.write("\x1b[?1000h\x1b[?1006h")  # report clicks in SGR form
+            mouse = True
         while True:
             if cur < top:
                 top = cur
@@ -662,6 +742,23 @@ def pick_sessions(rows: list[Session], cw: int, marks: list[int] | None = None) 
             out.flush()
             key = read_key(fd)
             status = ""
+            if isinstance(key, tuple):
+                button, x, y = key
+                hit = next(((attr, label) for start, end, attr, label in spans
+                            if 3 + start <= x - 1 < 3 + end), None)
+                if button == 0 and y == picker_top and hit:
+                    attr, label = hit
+                    if attr == sort_attr:
+                        reverse = not reverse
+                    else:
+                        sort_attr, reverse = attr, False
+                    marked = [rows[i] for i in marks]
+                    here = rows[cur]
+                    rows.sort(key=sort_key(attr), reverse=reverse)
+                    marks = [i for i, r in enumerate(rows) if any(r is m for m in marked)]
+                    cur = next((i for i, r in enumerate(rows) if r is here), 0)
+                    status = f"Sorted by {label} {'desc' if reverse else 'asc'}"
+                continue
             if key in ("j", "down"):
                 cur = min(cur + 1, len(rows) - 1)
             elif key in ("k", "up"):
@@ -694,6 +791,8 @@ def pick_sessions(rows: list[Session], cw: int, marks: list[int] | None = None) 
     except KeyboardInterrupt:
         return None
     finally:
+        if mouse:
+            out.write("\x1b[?1006l\x1b[?1000l")  # give mouse back to the terminal
         out.write("\r\x1b[J\x1b[?7h")  # erase the picker, restore autowrap
         out.flush()
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
