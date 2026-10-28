@@ -501,19 +501,46 @@ def dump_session(cwd: Path | None, session_id: str, out_path: Path | None) -> in
     return 0
 
 
-def confirm_remove(rows: list[Session], cwd: Path | None) -> int:
+def ask_confirm(prompt: str, allow_back: bool) -> str:
+    """Read a one-key answer: 'yes', 'no', or 'back' (Esc, when allow_back)."""
+    if not sys.stdin.isatty():
+        return "yes" if input(prompt).strip().lower() == "y" else "no"
+    out = sys.stdout
+    out.write(prompt)
+    out.flush()
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    tty.setcbreak(fd)
+    try:
+        key = read_key(fd)
+    except KeyboardInterrupt:
+        key = ""
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+    out.write("\n")
+    out.flush()
+    if key in ("y", "Y"):
+        return "yes"
+    return "back" if key == "esc" and allow_back else "no"
+
+
+def confirm_remove(rows: list[Session], cwd: Path | None, allow_back: bool = False) -> str:
+    """Confirm then remove rows; returns 'removed', 'aborted' or 'back'."""
     cw = cwd_width(rows, cwd)
     print(header(cw))
     for row in rows:
         print(format_row(row, cw))
-    ans = input(f"Remove {len(rows)} session(s) for {where(cwd)}? [y/N] ").strip().lower()
-    if ans != "y":
+    hint = ", Esc back" if allow_back else ""
+    ans = ask_confirm(f"Remove {len(rows)} session(s) for {where(cwd)}? [y/N{hint}] ", allow_back)
+    if ans == "back":
+        return "back"
+    if ans != "yes":
         print("Aborted.")
-        return 0
+        return "aborted"
     for row in rows:
         agent_of(row).remove(row)
     print(f"Removed {len(rows)} session(s).")
-    return 0
+    return "removed"
 
 
 def remove_matching(cwd: Path | None, patterns: list[str]) -> int:
@@ -531,21 +558,27 @@ def remove_matching(cwd: Path | None, patterns: list[str]) -> int:
         agent_of(matched[0]).remove(matched[0])
         print(f"Removed {matched[0].agent} session {matched[0].id}")
         return 0
-    return confirm_remove(matched, cwd)
+    confirm_remove(matched, cwd)
+    return 0
 
 
 def read_key(fd: int) -> str:
     ch = os.read(fd, 1)
     if ch != b"\x1b":
         return ch.decode(errors="replace")
-    # A bare Esc has nothing following it; arrow keys arrive as ESC [ A / ESC O A.
+    # A bare Esc has nothing following it; arrow keys arrive as ESC [ A / ESC O A,
+    # and Shift+arrows as ESC [ 1 ; 2 A / B (xterm) or ESC [ a / b (rxvt).
     if select.select([fd], [], [], 0.025)[0]:
         seq = os.read(fd, 8)
-        return {b"[A": "up", b"OA": "up", b"[B": "down", b"OB": "down"}.get(seq, "")
+        return {
+            b"[A": "up", b"OA": "up", b"[B": "down", b"OB": "down",
+            b"[1;2A": "shift-up", b"[1;2B": "shift-down",
+            b"[a": "shift-up", b"[b": "shift-down",
+        }.get(seq, "")
     return "esc"
 
 
-def pick_sessions(rows: list[Session], cw: int) -> list[int] | None:
+def pick_sessions(rows: list[Session], cw: int, marks: list[int] | None = None) -> list[int] | None:
     """Inline picker drawn below the cursor; returns marked row indexes, or None on q/Esc."""
     fd = sys.stdin.fileno()
     out = sys.stdout
@@ -554,8 +587,10 @@ def pick_sessions(rows: list[Session], cw: int) -> list[int] | None:
     body = min(len(rows), max(1, term.lines - 3))
     total = body + 2  # header + rows + footer
     cur = top = 0
-    marks: list[int] = []  # in mark order, so `u` undoes the latest
-    footer = "j/k move   Ctrl+f/b page   d mark   u undo   Enter confirm   q/Esc cancel"
+    marks = list(marks or [])  # in mark order, so `u` undoes the latest
+    if marks:  # resumed after Esc at the confirmation: start at the first mark
+        cur = top = min(marks)
+    footer = "j/k move  Ctrl+f/b page  Shift+↑/↓ select  d toggle  u undo  Enter confirm  q/Esc cancel"
 
     old = termios.tcgetattr(fd)
     tty.setcbreak(fd)
@@ -585,8 +620,15 @@ def pick_sessions(rows: list[Session], cw: int) -> list[int] | None:
                 cur = min(cur + body, len(rows) - 1)
             elif key == "\x02":  # Ctrl+b
                 cur = max(cur - body, 0)
+            elif key in ("shift-down", "shift-up"):
+                prev, cur = cur, min(max(cur + (1 if key == "shift-down" else -1), 0), len(rows) - 1)
+                for i in (prev, cur):  # extend the selection over both ends
+                    if i not in marks:
+                        marks.append(i)
             elif key == "d":
-                if cur not in marks:
+                if cur in marks:
+                    marks.remove(cur)
+                else:
                     marks.append(cur)
             elif key == "u":
                 if marks:
@@ -611,14 +653,19 @@ def interactive_remove(cwd: Path | None) -> int:
     if not rows:
         print(f"No sessions for {where(cwd)}")
         return 0
-    marks = pick_sessions(rows, cwd_width(rows, cwd))
-    if marks is None:
-        print("Cancelled.")
-        return 0
-    if not marks:
-        print("Nothing selected.")
-        return 0
-    return confirm_remove([rows[i] for i in sorted(marks)], cwd)
+    cw = cwd_width(rows, cwd)
+    marks: list[int] = []
+    while True:
+        picked = pick_sessions(rows, cw, marks)
+        if picked is None:
+            print("Cancelled.")
+            return 0
+        if not picked:
+            print("Nothing selected.")
+            return 0
+        if confirm_remove([rows[i] for i in sorted(picked)], cwd, allow_back=True) != "back":
+            return 0
+        marks = picked  # Esc at the confirmation: back to the picker, selection kept
 
 
 def main() -> int:
