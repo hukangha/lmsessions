@@ -709,8 +709,8 @@ def pick_sessions(
         )
     quit_hint = "quit:q back:Esc" if hits is not None else "quit:q/Esc"
     footer = (
-        "j/k:move /:search Ctrl+f/b:page g/G:top/bottom ←→/Tab:sort s:↑↓ Shift+j/k or Space:toggle"
-        f" y:copy-id d:dump del:delete Enter:goto {quit_hint}"
+        "move:j/k,↓/↑ search:/ page:Ctrl+f/b top/bottom:g/G title:←→/Tab sort:s toggle:Shift+j/k,Space"
+        f" copy-id:y dump:d delete:del goto:Enter {quit_hint}"
     )
     status = ""  # footer message, e.g. after yanking an id
     shift_dir: int | None = None  # direction of the current Shift+j/k run
