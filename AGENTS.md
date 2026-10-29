@@ -89,6 +89,12 @@ top-left corner, and restores both on exit. Mouse reporting (`?1000/?1006`) is
 enabled only if `cursor_row()` (DSR) gets an answer, needed to map click
 coordinates.
 
+A resize redraws at the new size: `SIGWINCH` writes through
+`signal.set_wakeup_fd` to a pipe, and `next_key()` selects on stdin and that
+pipe, returning `"resize"`. `resize()` re-measures the terminal, re-queries
+`picker_top`, and erases the old frame (`ESC [ J`) before the next frame is
+drawn — otherwise the fixed cursor-up count would leave stale lines behind.
+
 State: `cur`, `top`, `marks` (row indexes), `status`, `sort_attr`/`reverse`,
 `hits`, `focus` (session to re-highlight when returning from a sub-action).
 

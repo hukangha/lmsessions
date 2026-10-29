@@ -13,6 +13,7 @@ import os
 import re
 import select
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -793,8 +794,39 @@ def pick_sessions(
         out.flush()
         return row_map
 
+    def next_key() -> str | tuple[int, int, int]:
+        """read_key, but returns 'resize' when a SIGWINCH arrives instead."""
+        if _pending:
+            return read_key(fd)
+        if fd in select.select([fd, resize_r], [], [])[0]:
+            return read_key(fd)
+        try:  # one redraw per burst of resizes: drain the wakeup bytes
+            while os.read(resize_r, 64):
+                pass
+        except BlockingIOError:
+            pass
+        return "resize"
+
+    def resize() -> None:
+        """Re-measure after a resize and drop the frame drawn at the old size."""
+        nonlocal width, body, total, picker_top
+        term = shutil.get_terminal_size()
+        width, body = term.columns - 1, max(1, term.lines - 3)
+        total = body + 2
+        out.write("\x1b[J")  # the old frame may be wider or taller than the new one
+        out.flush()
+        if picker_top is not None:
+            picker_top = cursor_row(fd)  # the frame moved: clicks need the new row
+
     old = termios.tcgetattr(fd)
     tty.setcbreak(fd)
+    # A resize must wake the blocked key read: Python retries the interrupted
+    # read, so SIGWINCH writes a byte to a pipe and next_key() watches both.
+    resize_r, resize_w = os.pipe()
+    for pipe_fd in (resize_r, resize_w):
+        os.set_blocking(pipe_fd, False)
+    old_winch = signal.signal(signal.SIGWINCH, lambda *_: None)
+    old_wakeup = signal.set_wakeup_fd(resize_w, warn_on_full_buffer=False)
     # Autowrap off: a line wider than the terminal would take two rows and
     # break the fixed cursor-up count, leaving stale lines behind. Hide the
     # cursor too: it would otherwise blink at the frame's top-left corner.
@@ -810,7 +842,10 @@ def pick_sessions(
             mouse = True
         while True:
             row_map = frame(status or footer)
-            key = read_key(fd)
+            key = next_key()
+            if key == "resize":
+                resize()
+                continue
             status = ""
             if key not in ("J", "K", "shift-down", "shift-up"):
                 shift_dir = None  # any other key ends the current shift run
@@ -878,7 +913,10 @@ def pick_sessions(
                 pattern = ""
                 while True:
                     frame(f"/{pattern}")
-                    key = read_key(fd)
+                    key = next_key()
+                    if key == "resize":
+                        resize()
+                        continue
                     if key in ("\r", "\n"):
                         if pattern:
                             return "search", pattern, rows[cur], (sort_attr, reverse)
@@ -904,6 +942,10 @@ def pick_sessions(
     except KeyboardInterrupt:
         return None
     finally:
+        signal.set_wakeup_fd(old_wakeup)
+        signal.signal(signal.SIGWINCH, old_winch)
+        os.close(resize_r)
+        os.close(resize_w)
         if mouse:
             out.write("\x1b[?1006l\x1b[?1000l")  # give mouse back to the terminal
         out.write("\r\x1b[J\x1b[?7h\x1b[?25h")  # erase the picker, restore autowrap and cursor
