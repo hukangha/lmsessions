@@ -485,15 +485,15 @@ def snippet(line: str, m: re.Match, width: int = 120) -> Hit:
     )
 
 
-def terminal_bg() -> tuple[int, int, int] | None:
-    """The terminal's background as 8-bit RGB, asked for with OSC 11; None if it doesn't answer."""
+def terminal_color(ps: int) -> tuple[int, int, int] | None:
+    """Terminal colour ps (10 foreground, 11 background) as 8-bit RGB; None if unanswered."""
     if not (sys.stdin.isatty() and sys.stdout.isatty()):
         return None
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
     tty.setcbreak(fd)
     try:
-        sys.stdout.write("\x1b]11;?\x1b\\")
+        sys.stdout.write(f"\x1b]{ps};?\x1b\\")
         sys.stdout.flush()
         reply = b""
         while not reply.endswith((b"\x07", b"\x1b\\")) and select.select([fd], [], [], 0.1)[0]:
@@ -506,15 +506,26 @@ def terminal_bg() -> tuple[int, int, int] | None:
     return tuple(int(c, 16) * 255 // (16 ** len(c) - 1) for c in m.groups())
 
 
-def shade_codes() -> tuple[str, str]:
-    """Background escapes slightly off the terminal bg: (row highlight, keyword highlight)."""
-    bg = terminal_bg()
+def shade_codes() -> tuple[str, str, str]:
+    """Background escapes: (row highlight, keyword highlight, current row when marked).
+
+    The first two sit slightly off the terminal bg; the last is the midpoint between
+    the terminal bg and fg."""
+    bg = terminal_color(11)
     if bg is None:
-        return "\x1b[48;5;236m", "\x1b[48;5;240m"
+        return "\x1b[48;5;236m", "\x1b[48;5;240m", "\x1b[48;5;236m"
     step = 20 if sum(bg) < 3 * 128 else -20
     r, g, b = (min(255, max(0, c + step)) for c in bg)
     r2, g2, b2 = (min(255, max(0, c + 2 * step)) for c in bg)
-    return f"\x1b[48;2;{r};{g};{b}m", f"\x1b[48;2;{r2};{g2};{b2}m"
+    fg = terminal_color(10)
+    if fg is None:
+        return f"\x1b[48;2;{r};{g};{b}m", f"\x1b[48;2;{r2};{g2};{b2}m", f"\x1b[48;2;{r};{g};{b}m"
+    r3, g3, b3 = ((c + s) // 2 for c, s in zip(bg, fg))
+    return (
+        f"\x1b[48;2;{r};{g};{b}m",
+        f"\x1b[48;2;{r2};{g2};{b2}m",
+        f"\x1b[48;2;{r3};{g3};{b3}m",
+    )
 
 
 def find_hits(s: Session, rx: re.Pattern) -> list[Hit]:
@@ -545,40 +556,16 @@ def dump_session(s: Session, out: Path) -> None:
     print(f"{len(merged)} turns written to {out}")
 
 
-def ask_confirm(prompt: str) -> str:
-    """Read a one-key answer: 'yes', 'no', or 'back' (Esc)."""
-    out = sys.stdout
-    out.write(prompt)
-    out.flush()
-    fd = sys.stdin.fileno()
-    old = termios.tcgetattr(fd)
-    tty.setcbreak(fd)
-    try:
-        key = read_key(fd)
-    except KeyboardInterrupt:
-        key = ""
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old)
-    out.write("\n")
-    out.flush()
-    if key in ("y", "Y"):
-        return "yes"
-    return "back" if key == "esc" else "no"
-
-
 def confirm_remove(rows: list[Session], cwd: Path | None) -> str:
-    """Confirm then remove rows; returns 'removed', 'back' or 'clear'."""
+    """Confirm then remove rows; returns 'removed', or 'back' if Esc was pressed."""
     cw = cwd_width(rows, cwd)
     print(header(cw))
     for row in rows:
         print(format_row(row, cw))
-    ans = ask_confirm(
-        f"Remove {len(rows)} session(s) for {where(cwd)}? [y/N, Esc back, n clears selection] "
-    )
-    if ans == "back":
+    if not ask_enter(
+        f"Remove {len(rows)} session(s) for {where(cwd)}? [Enter/Esc] "
+    ):
         return "back"
-    if ans != "yes":  # n/Enter: back to the picker, but with nothing selected
-        return "clear"
     for row in rows:
         agent_of(row).remove(row)
     print(f"Removed {len(rows)} session(s).")
@@ -648,11 +635,12 @@ def read_key(fd: int) -> str | tuple[int, int, int]:
         return ch.decode(errors="replace")
     # A bare Esc has nothing following it; keys arrive as CSI/SS3 sequences:
     # ESC [ A / ESC O A (up), ESC [ 1 ; 2 A (shift-up), ESC [ a (rxvt shift-up),
+    # ESC [ C / ESC [ D (right/left), ESC [ 3 ~ (Delete),
     # ESC [ < button ; x ; y M (SGR mouse press).
     seq = b""
     while _pending or select.select([fd], [], [], 0.025)[0]:
         seq += read_byte(fd)
-        if len(seq) > 1 and seq[-1:] in b"ABMmab~":
+        if len(seq) > 1 and seq[-1:] in b"ABCDMmab~":
             break
     if not seq:
         return "esc"
@@ -661,8 +649,10 @@ def read_key(fd: int) -> str | tuple[int, int, int]:
         return int(mouse.group(1)), int(mouse.group(2)), int(mouse.group(3))
     return {
         b"[A": "up", b"OA": "up", b"[B": "down", b"OB": "down",
+        b"[C": "right", b"OC": "right", b"[D": "left", b"OD": "left",
         b"[1;2A": "shift-up", b"[1;2B": "shift-down",
         b"[a": "shift-up", b"[b": "shift-down",
+        b"[3~": "delete",
     }.get(seq, "")
 
 
@@ -678,9 +668,9 @@ def pick_sessions(
     hits maps (agent, id) to matched snippets; when given, snippets are shown
     under each session (all of them for the current or a marked row). focus is
     the session to highlight on start. Returns (action, payload, current) where
-    action is 'remove'|'dump' (row indexes) on r/d, 'resume' (session) on Enter,
-    'search' (pattern) on / + Enter, 'back' (None) on Esc from a search page,
-    or None on q/Esc at the top level."""
+    action is 'remove'|'dump' (the marked row indexes, possibly empty) on
+    Delete/d, 'resume' (session) on Enter, 'search' (pattern) on / + Enter,
+    'back' (None) on Esc from a search page, or None on q/Esc at the top level."""
     fd = sys.stdin.fileno()
     out = sys.stdout
     term = shutil.get_terminal_size()
@@ -688,16 +678,21 @@ def pick_sessions(
     body = max(1, term.lines - 3)
     total = body + 2  # header + body + footer
     cur = top = 0
-    marks = list(marks or [])  # in mark order, so `u` undoes the latest
+    marks = list(marks or [])  # row indexes
     if marks:  # resumed after Esc at the confirmation: start at the first mark
         cur = min(marks)
     if focus is not None:  # resumes after backing out of dump/removal/search
         cur = next(
             (i for i, r in enumerate(rows) if (r.agent, r.id) == (focus.agent, focus.id)), cur
         )
-    footer = "j/k move  / search  Ctrl+f/b page  g/G top/bottom  Shift+j/k select  Space toggle  u undo  y copy id  d dump  r remove  Enter resume  q quit  Esc back"
+    quit_hint = "quit:q back:Esc" if hits is not None else "quit:q/Esc"
+    footer = (
+        "j/k:move /:search Ctrl+f/b:page g/G:top/bottom Shift+j/k or Space:toggle"
+        f" y:copy-id d:dump del:delete Enter:goto {quit_hint}"
+    )
     status = ""  # footer message, e.g. after yanking an id
-    shade, match_shade = shade_codes()
+    shift_dir: int | None = None  # direction of the current Shift+j/k run
+    shade, match_shade, both_shade = shade_codes()
     spans = header_spans(cw)
     cwd_span = next(((start, end) for start, end, attr, _ in spans if attr == "cwd"), None)
     sort_attr: str | None = None
@@ -713,16 +708,26 @@ def pick_sessions(
     def height(i: int) -> int:
         return 1 + len(content(i))
 
+    def toggle(i: int) -> None:
+        if i in marks:
+            marks.remove(i)
+        else:
+            marks.append(i)
+
     def content_line(hit: Hit, current: bool, marked: bool) -> str:
         """One snippet line, with the matched keyword in a second highlight colour."""
         prefix = "        │ "
         text, start, end = hit
         text = text[:max(0, width - len(prefix))]
         start, end = min(start, len(text)), min(end, len(text))
-        if start < end and current:  # inside reverse video: step out for the keyword
-            text = f"{text[:start]}\x1b[27m{match_shade}{text[start:end]}\x1b[0m\x1b[7m{text[end:]}"
-        elif start < end and marked:
-            text = f"{text[:start]}{match_shade}{text[start:end]}\x1b[0m{shade}{text[end:]}"
+        if start < end and (current or marked):
+            if current and marked:
+                back = both_shade
+            elif current:
+                back = "\x1b[7m"
+            else:
+                back = shade
+            text = f"{text[:start]}\x1b[0m{match_shade}{text[start:end]}\x1b[0m{back}{text[end:]}"
         return prefix + text
 
     def frame(footer_line: str) -> list[tuple[int, bool]]:
@@ -744,7 +749,9 @@ def pick_sessions(
             ]
             entry = entry[:body - used]
             for j, line in enumerate(entry):
-                if current:
+                if current and marked:
+                    line = f"{both_shade}{line}\x1b[0m"
+                elif current:
                     line = f"\x1b[7m{line}\x1b[0m"
                 elif marked:
                     line = f"{shade}{line}\x1b[0m"
@@ -761,8 +768,9 @@ def pick_sessions(
     old = termios.tcgetattr(fd)
     tty.setcbreak(fd)
     # Autowrap off: a line wider than the terminal would take two rows and
-    # break the fixed cursor-up count, leaving stale lines behind.
-    out.write("\x1b[?7l" + "\n" * total + f"\x1b[{total}A")  # make room below the cursor
+    # break the fixed cursor-up count, leaving stale lines behind. Hide the
+    # cursor too: it would otherwise blink at the frame's top-left corner.
+    out.write("\x1b[?25l\x1b[?7l" + "\n" * total + f"\x1b[{total}A")  # make room below the cursor
     out.flush()
     picker_top = None
     mouse = False
@@ -776,6 +784,8 @@ def pick_sessions(
             row_map = frame(status or footer)
             key = read_key(fd)
             status = ""
+            if key not in ("J", "K", "shift-down", "shift-up"):
+                shift_dir = None  # any other key ends the current shift run
             if isinstance(key, tuple):
                 button, x, y = key
                 col = x - 1  # 0-based screen column; the rows start three chars in
@@ -816,19 +826,19 @@ def pick_sessions(
             elif key == "G":
                 cur = len(rows) - 1
             elif key in ("J", "K", "shift-down", "shift-up"):
+                # Toggle the row you step onto, plus the row you are leaving
+                # when the direction changes (or a run starts): holding the
+                # key toggles a run of rows, reversing un-toggles it back.
                 step = 1 if key in ("J", "shift-down") else -1
-                prev, cur = cur, min(max(cur + step, 0), len(rows) - 1)
-                for i in (prev, cur):  # extend the selection over both ends
-                    if i not in marks:
-                        marks.append(i)
+                nxt = min(max(cur + step, 0), len(rows) - 1)
+                if step != shift_dir:
+                    toggle(cur)
+                if nxt != cur:
+                    toggle(nxt)
+                    cur = nxt
+                shift_dir = step
             elif key == " ":
-                if cur in marks:
-                    marks.remove(cur)
-                else:
-                    marks.append(cur)
-            elif key == "u":
-                if marks:
-                    marks.pop()
+                toggle(cur)
             elif key == "y":
                 sid = rows[cur].id
                 status = f"Copied {sid}" if copy_to_clipboard(sid) else f"OSC 52 only: {sid}"
@@ -850,9 +860,9 @@ def pick_sessions(
                     elif isinstance(key, str) and len(key) == 1 and key.isprintable():
                         pattern += key
             elif key == "d":
-                return "dump", marks or [cur], rows[cur]
-            elif key == "r":
-                return "remove", marks or [cur], rows[cur]
+                return "dump", marks, rows[cur]
+            elif key == "delete":
+                return "remove", marks, rows[cur]
             elif key in ("\r", "\n"):
                 return "resume", rows[cur], rows[cur]
             elif key == "esc" and hits is not None:
@@ -864,7 +874,7 @@ def pick_sessions(
     finally:
         if mouse:
             out.write("\x1b[?1006l\x1b[?1000l")  # give mouse back to the terminal
-        out.write("\r\x1b[J\x1b[?7h")  # erase the picker, restore autowrap
+        out.write("\r\x1b[J\x1b[?7h\x1b[?25h")  # erase the picker, restore autowrap and cursor
         out.flush()
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
@@ -876,36 +886,6 @@ def resume_session(s: Session) -> int:
         print(f"Cannot resume {s.agent} session {s.id}: {e}", file=sys.stderr)
         return 1
     return 0
-
-
-def prompt_name(prompt: str, default: str) -> str | None:
-    """Read a filename prefilled with default; None if Esc or Ctrl+O backs out."""
-    out = sys.stdout
-    fd = sys.stdin.fileno()
-    old = termios.tcgetattr(fd)
-    tty.setcbreak(fd)
-    buf = default
-    try:
-        while True:
-            out.write(f"\r\x1b[K{prompt}{buf}")
-            out.flush()
-            key = read_key(fd)
-            if key in ("\r", "\n"):
-                return buf.strip() or default
-            if key in ("esc", "\x0f"):  # Ctrl+O
-                return None
-            if key in ("\x7f", "\b"):
-                buf = buf[:-1]
-            elif key == "\x15":  # Ctrl+U
-                buf = ""
-            elif isinstance(key, str) and len(key) == 1 and key.isprintable():
-                buf += key
-    except KeyboardInterrupt:
-        return None
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old)
-        out.write("\r\x1b[K")
-        out.flush()
 
 
 def ask_enter(prompt: str) -> bool:
@@ -931,20 +911,65 @@ def ask_enter(prompt: str) -> bool:
         out.flush()
 
 
+def rename_dump(names: list[str]) -> list[str] | None:
+    """Rename each dump file on its own line; None if Esc or Ctrl+O backs out.
+
+    Up/Down pick a file, Left/Right move the cursor within it, Enter dumps."""
+    names = list(names)
+    pos = [len(n) for n in names]  # cursor position, one per name
+    sel = 0
+    out = sys.stdout
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    tty.setcbreak(fd)
+    height = len(names) + 2
+    try:
+        while True:
+            lines = [f"Dump {len(names)} session(s) as:"]
+            for i, name in enumerate(names):
+                if i == sel:
+                    c = pos[i]
+                    name = f"{name[:c]}\x1b[7m{name[c:c + 1] or ' '}\x1b[0m{name[c + 1:]}"
+                lines.append(f"{'>' if i == sel else ' '} {name}")
+            lines.append("[Enter/Esc]")
+            out.write("".join(f"\r\x1b[K{line}\n" for line in lines) + f"\x1b[{height}A")
+            out.flush()
+            key = read_key(fd)
+            if key in ("\r", "\n"):
+                return names
+            if key in ("esc", "\x0f"):  # Ctrl+O
+                return None
+            if key in ("up", "down"):
+                sel = min(max(sel + (1 if key == "down" else -1), 0), len(names) - 1)
+            elif key == "left":
+                pos[sel] = max(0, pos[sel] - 1)
+            elif key == "right":
+                pos[sel] = min(len(names[sel]), pos[sel] + 1)
+            elif key in ("\x7f", "\b"):
+                if pos[sel]:
+                    names[sel] = names[sel][:pos[sel] - 1] + names[sel][pos[sel]:]
+                    pos[sel] -= 1
+            elif key == "\x15":  # Ctrl+U
+                names[sel], pos[sel] = "", 0
+            elif isinstance(key, str) and len(key) == 1 and key.isprintable():
+                names[sel] = names[sel][:pos[sel]] + key + names[sel][pos[sel]:]
+                pos[sel] += 1
+    except KeyboardInterrupt:
+        return None
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        out.write("\r\x1b[J")
+        out.flush()
+
+
 def dump_selected(rows: list[Session]) -> bool:
     """Dump sessions into the current directory; False if the prompt was backed out of."""
-    if len(rows) == 1:
-        name = prompt_name("Dump as: ", f"{rows[0].id}.txt")
-        if name is None:
-            return False
-        dump_session(rows[0], Path(name))
-        return True
-    if not ask_enter(
-        f"Dump {len(rows)} sessions as <session-id>_dump.txt each? [Enter dump, Esc/Ctrl+O back] "
-    ):
+    suffix = ".txt" if len(rows) == 1 else "_dump.txt"
+    names = rename_dump([f"{s.id}{suffix}" for s in rows])
+    if names is None:
         return False
-    for s in rows:
-        dump_session(s, Path(f"{s.id}_dump.txt"))
+    for s, name in zip(rows, names):
+        dump_session(s, Path(name.strip() or f"{s.id}{suffix}"))
     return True
 
 
@@ -997,18 +1022,16 @@ def interactive_menu(cwd: Path | None) -> int:
             continue
         if isinstance(payload, Session):
             return resume_session(payload)
-        targets = [rows[i] for i in sorted(payload)]
+        targets = [rows[i] for i in sorted(payload)] or [focus]
         if kind == "dump":
-            if not dump_selected(targets):  # cancelled at the name prompt
+            if not dump_selected(targets):  # backed out of the dump prompt
+                marks = payload  # back to the picker, selection kept
                 continue
             marks = []
             continue
         result = confirm_remove(targets, cwd)
         if result == "back":
             marks = payload  # Esc at the confirmation: back to the picker, selection kept
-            continue
-        if result == "clear":
-            marks = []  # n at the confirmation: back, but with nothing selected
             continue
         # Removed: pick again from what is left instead of exiting.
         history = []  # its pages may point at removed sessions
