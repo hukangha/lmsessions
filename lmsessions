@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """List, search, remove, dump or resume coding-agent sessions (Claude Code,
 Codex, OpenCode). With no arguments, open the interactive menu; -l lists them
-instead (add -a for every directory); press / in the menu to search.
+instead; -a covers every directory, not just $PWD. Press / in the menu to search.
 
 To support another agent, subclass `Agent` and add an instance to `AGENTS`.
 """
@@ -1029,7 +1029,7 @@ def main() -> int:
         description="List, search, remove, dump or resume "
         + "/".join(a.name for a in AGENTS)
         + " sessions; with no arguments, open the interactive menu "
-        "(-l lists them, -a includes every directory).",
+        "(-l lists them; -a covers every directory).",
     )
     parser.add_argument(
         "-l", "--list", dest="l", action="store_true", help="list sessions for $PWD"
@@ -1038,17 +1038,11 @@ def main() -> int:
         "-a",
         "--all",
         action="store_true",
-        help="apply -l to sessions in every directory, not just $PWD",
+        help="apply to sessions in every directory, not just $PWD",
     )
-    if not sys.argv[1:]:
-        return interactive_menu(Path(os.getcwd()).resolve())
-    if set(sys.argv[1:]) <= {"-a", "--all"}:
-        parser.print_usage()
-        print()
-        return list_sessions(None)
-
     args = parser.parse_args()
-    return list_sessions(None if args.all else Path(os.getcwd()).resolve())
+    cwd = None if args.all else Path(os.getcwd()).resolve()
+    return list_sessions(cwd) if args.l else interactive_menu(cwd)
 
 
 if __name__ == "__main__":
