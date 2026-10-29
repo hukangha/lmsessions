@@ -62,7 +62,10 @@ Each implements `sessions(cwd)`, `remove(s)`, `resume(s)`, `transcript(s)`.
 `COLUMNS` defines label/width/sort-attr/alignment; `columns(cw)` appends CWD
 when `cw > 0`. `header`, `header_spans` (click targets), `format_row` must all
 agree on widths — the picker slices/truncates by them. `sort_key(attr)` sorts
-strings case-insensitively.
+strings case-insensitively. `header(cw, sort_attr, reverse)` reverse-videos the
+sorted column and appends `↑`/`↓` inside it (or in the following gap when the
+label already fills the width, as PROMPTS does); the escapes are zero-width, so
+click spans are unaffected.
 
 ## Listing / search / dump
 
@@ -89,13 +92,15 @@ coordinates.
 State: `cur`, `top`, `marks` (row indexes), `status`, `sort_attr`/`reverse`,
 `hits`, `focus` (session to re-highlight when returning from a sub-action).
 
-Keys: `j/k`/arrows move, `Ctrl+f/b` page, `g/G` first/last, `J/K`/Shift-arrows
-toggle the row stepped onto, plus the row being left when the run starts or
-reverses direction (so holding it toggles a run and reversing un-toggles it
-back; at a list end a held key does nothing), `Space` toggle the current row,
-`y` copy id, `/` incremental search, `d` dump, `Delete` remove, `Enter` resume,
-`q` quit, `Esc` quit (or back when `hits` set). Clicking a header sorts (same
-header toggles direction); marks and cursor follow sessions by identity.
+Keys: `j/k`/arrows move, `Ctrl+f/b` page, `g/G` first/last, `s` cycle the sort
+through the header columns (a full pass flips the direction and starts over),
+`J/K`/Shift-arrows toggle the row stepped onto, plus the row being left when the
+run starts or reverses direction (so holding it toggles a run and reversing
+un-toggles it back; at a list end a held key does nothing), `Space` toggle the
+current row, `y` copy id, `/` incremental search, `d` dump, `Delete` remove,
+`Enter` resume, `q` quit, `Esc` quit (or back when `hits` set). Clicking a
+header sorts (same header toggles direction); marks and cursor follow sessions
+by identity.
 Clicking a row copies the CWD (or, outside that column, the transcript's
 directory).
 
@@ -143,4 +148,5 @@ rebuilds `rows` from `all_sessions(cwd)`, reapplying all filters. Confirmation
 - Removal is immediate and permanent (no trash/undo).
 - `interactive_menu` requires a tty; otherwise it prints a hint and exits 1.
 - Only documented behavior: sessions are sorted by mtime ascending (oldest at
-  top) unless the user clicks a header.
+  top) unless the user clicks a header or presses `s` (the header then shows the
+  sorted column and direction).

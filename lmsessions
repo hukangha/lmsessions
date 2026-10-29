@@ -427,9 +427,24 @@ def columns(cw: int = 0) -> list[tuple[str, int, str, str]]:
     return list(COLUMNS) + ([("CWD", cw, "cwd", "<")] if cw else [])
 
 
-def header(cw: int = 0) -> str:
-    parts = [f"{label:{align}{width}}" for label, width, _, align in columns(cw)]
-    return "  ".join(parts) + "  TITLE"
+def header(cw: int = 0, sort_attr: str | None = None, reverse: bool = False) -> str:
+    """Header line; the sorted column is highlighted and shows its direction."""
+    arrow = "↓" if reverse else "↑"
+    line = ""
+    for label, width, attr, align in columns(cw):
+        cell = f"{label:{align}{width}}"
+        gap = "  "
+        if attr == sort_attr:
+            if len(label) + 1 <= width:  # room for the arrow inside the column
+                text = label + arrow
+                pad = " " * (width - len(text))
+                cell = pad + f"\x1b[7m{text}\x1b[27m" if align == ">" else f"\x1b[7m{text}\x1b[27m" + pad
+            else:  # no room (PROMPTS is labelled to its full width): use the gap
+                cell = f"\x1b[7m{label:{align}{width}}{arrow}\x1b[27m"
+                gap = " "
+        line += cell + gap
+    title = "TITLE" + arrow if sort_attr == "title" else "TITLE"
+    return line + (f"\x1b[7m{title}\x1b[27m" if sort_attr == "title" else title)
 
 
 def header_spans(cw: int = 0) -> list[tuple[int, int, str, str]]:
@@ -687,7 +702,7 @@ def pick_sessions(
         )
     quit_hint = "quit:q back:Esc" if hits is not None else "quit:q/Esc"
     footer = (
-        "j/k:move /:search Ctrl+f/b:page g/G:top/bottom Shift+j/k or Space:toggle"
+        "j/k:move /:search Ctrl+f/b:page g/G:top/bottom s:sort Shift+j/k or Space:toggle"
         f" y:copy-id d:dump del:delete Enter:goto {quit_hint}"
     )
     status = ""  # footer message, e.g. after yanking an id
@@ -695,7 +710,7 @@ def pick_sessions(
     shade, match_shade, both_shade = shade_codes()
     spans = header_spans(cw)
     cwd_span = next(((start, end) for start, end, attr, _ in spans if attr == "cwd"), None)
-    sort_attr: str | None = None
+    sort_attr: str | None = "mtime"  # the list starts out oldest first
     reverse = False
 
     def content(i: int) -> list[Hit]:
@@ -713,6 +728,16 @@ def pick_sessions(
             marks.remove(i)
         else:
             marks.append(i)
+
+    def sort_rows(attr: str, label: str) -> None:
+        """Sort by attr, keeping marks and the cursor on the same sessions."""
+        nonlocal cur, marks, status
+        marked = [rows[i] for i in marks]
+        here = rows[cur]
+        rows.sort(key=sort_key(attr), reverse=reverse)
+        marks = [i for i, r in enumerate(rows) if any(r is m for m in marked)]
+        cur = next((i for i, r in enumerate(rows) if r is here), 0)
+        status = f"Sorted by {label} {'desc' if reverse else 'asc'}"
 
     def content_line(hit: Hit, current: bool, marked: bool) -> str:
         """One snippet line, with the matched keyword in a second highlight colour."""
@@ -737,7 +762,7 @@ def pick_sessions(
             top = cur
         while top < cur and sum(height(i) for i in range(top, cur + 1)) > body:
             top += 1
-        lines = [f"\x1b[1m   {header(cw)}\x1b[0m"]
+        lines = [f"\x1b[1m   {header(cw, sort_attr, reverse)}\x1b[0m"]
         row_map = []
         used = 0
         i = top
@@ -798,12 +823,7 @@ def pick_sessions(
                         reverse = not reverse
                     else:
                         sort_attr, reverse = attr, False
-                    marked = [rows[i] for i in marks]
-                    here = rows[cur]
-                    rows.sort(key=sort_key(attr), reverse=reverse)
-                    marks = [i for i, r in enumerate(rows) if any(r is m for m in marked)]
-                    cur = next((i for i, r in enumerate(rows) if r is here), 0)
-                    status = f"Sorted by {label} {'desc' if reverse else 'asc'}"
+                    sort_rows(attr, label)
                 elif button == 0 and 0 <= row < len(row_map):
                     cur, on_session_row = row_map[row]
                     s = rows[cur]
@@ -825,6 +845,15 @@ def pick_sessions(
                 cur = 0
             elif key == "G":
                 cur = len(rows) - 1
+            elif key == "s":
+                # Cycle the sort through the header columns; a full pass flips
+                # the direction and starts over.
+                attrs = [(attr, label) for _, _, attr, label in spans]
+                i = next((n for n, (attr, _) in enumerate(attrs) if attr == sort_attr), -1)
+                if i + 1 >= len(attrs):
+                    reverse = not reverse
+                sort_attr, label = attrs[(i + 1) % len(attrs)]
+                sort_rows(sort_attr, label)
             elif key in ("J", "K", "shift-down", "shift-up"):
                 # Toggle the row you step onto, plus the row you are leaving
                 # when the direction changes (or a run starts): holding the
