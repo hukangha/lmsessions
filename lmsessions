@@ -1119,6 +1119,7 @@ def interactive_menu(cwd: Path | None) -> int:
             continue
         # Removed: pick again from what is left instead of exiting.
         history = []  # its pages may point at removed sessions
+        here = next((i for i, s in enumerate(rows) if s is focus), 0)  # keep the highlight's row
         rows = [s for s in rebuild_rows() if all(find_hits(s, rx) for rx in filters)]
         hits = (
             {(s.agent, s.id): find_hits(s, filters[-1]) for s in rows} if filters else None
@@ -1128,6 +1129,7 @@ def interactive_menu(cwd: Path | None) -> int:
             return 0
         cw = cwd_width(rows, cwd)
         marks = []
+        focus = rows[min(here, len(rows) - 1)]
 
 
 def main() -> int:

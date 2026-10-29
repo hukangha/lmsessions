@@ -132,7 +132,8 @@ After a removal it discards history (it may point at gone sessions) and
 rebuilds `rows` with `rebuild_rows()`, reapplying all filters. That helper keeps
 the sessions in the order they were last shown (unseen ones last) rather than
 `all_sessions()`'s oldest-first order, so ties of the sort column do not
-reshuffle after a delete. Confirmation
+reshuffle after a delete. The highlight keeps its row index into the rebuilt
+list (clamped to the last row) instead of jumping to the top. Confirmation
 (`confirm_remove`) semantics: `Enter` deletes, `Esc` returns with `marks` kept.
 
 ## Terminal plumbing
