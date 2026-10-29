@@ -92,8 +92,9 @@ coordinates.
 State: `cur`, `top`, `marks` (row indexes), `status`, `sort_attr`/`reverse`,
 `hits`, `focus` (session to re-highlight when returning from a sub-action).
 
-Keys: `j/k`/arrows move, `Ctrl+f/b` page, `g/G` first/last, `s` cycle the sort
-through the header columns (a full pass flips the direction and starts over),
+Keys: `j/k`/up/down arrows move, `Ctrl+f/b` page, `g/G` first/last,
+`Tab`/`→`/`←` cycle the sort through the header columns (TITLE included), `s`
+toggles the sort direction,
 `J/K`/Shift-arrows toggle the row stepped onto, plus the row being left when the
 run starts or reverses direction (so holding it toggles a run and reversing
 un-toggles it back; at a list end a held key does nothing), `Space` toggle the
@@ -148,5 +149,6 @@ rebuilds `rows` from `all_sessions(cwd)`, reapplying all filters. Confirmation
 - Removal is immediate and permanent (no trash/undo).
 - `interactive_menu` requires a tty; otherwise it prints a hint and exits 1.
 - Only documented behavior: sessions are sorted by mtime ascending (oldest at
-  top) unless the user clicks a header or presses `s` (the header then shows the
-  sorted column and direction).
+  top) unless the user clicks a header, presses `Tab`/`→`/`←` (cycles columns)
+  or `s` (toggles direction) (the header then shows the sorted column and
+  direction).

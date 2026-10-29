@@ -447,13 +447,13 @@ def header(cw: int = 0, sort_attr: str | None = None, reverse: bool = False) -> 
     return line + (f"\x1b[7m{title}\x1b[27m" if sort_attr == "title" else title)
 
 
-def header_spans(cw: int = 0) -> list[tuple[int, int, str, str]]:
-    """(start, end, sort attribute, label) of each clickable header column."""
+def header_spans(cw: int = 0) -> list[tuple[int, int, str]]:
+    """(start, end, sort attribute) of each clickable header column."""
     spans, x = [], 0
-    for label, width, attr, _ in columns(cw):
-        spans.append((x, x + width, attr, label))
+    for _, width, attr, _ in columns(cw):
+        spans.append((x, x + width, attr))
         x += width + 2
-    spans.append((x, 1 << 30, "title", "TITLE"))
+    spans.append((x, 1 << 30, "title"))
     return spans
 
 
@@ -702,14 +702,14 @@ def pick_sessions(
         )
     quit_hint = "quit:q back:Esc" if hits is not None else "quit:q/Esc"
     footer = (
-        "j/k:move /:search Ctrl+f/b:page g/G:top/bottom s:sort Shift+j/k or Space:toggle"
+        "j/k:move /:search Ctrl+f/b:page g/G:top/bottom ←→/Tab:sort s:↑↓ Shift+j/k or Space:toggle"
         f" y:copy-id d:dump del:delete Enter:goto {quit_hint}"
     )
     status = ""  # footer message, e.g. after yanking an id
     shift_dir: int | None = None  # direction of the current Shift+j/k run
     shade, match_shade, both_shade = shade_codes()
     spans = header_spans(cw)
-    cwd_span = next(((start, end) for start, end, attr, _ in spans if attr == "cwd"), None)
+    cwd_span = next(((start, end) for start, end, attr in spans if attr == "cwd"), None)
     sort_attr: str | None = "mtime"  # the list starts out oldest first
     reverse = False
 
@@ -729,15 +729,14 @@ def pick_sessions(
         else:
             marks.append(i)
 
-    def sort_rows(attr: str, label: str) -> None:
+    def sort_rows(attr: str) -> None:
         """Sort by attr, keeping marks and the cursor on the same sessions."""
-        nonlocal cur, marks, status
+        nonlocal cur, marks
         marked = [rows[i] for i in marks]
         here = rows[cur]
         rows.sort(key=sort_key(attr), reverse=reverse)
         marks = [i for i, r in enumerate(rows) if any(r is m for m in marked)]
         cur = next((i for i, r in enumerate(rows) if r is here), 0)
-        status = f"Sorted by {label} {'desc' if reverse else 'asc'}"
 
     def content_line(hit: Hit, current: bool, marked: bool) -> str:
         """One snippet line, with the matched keyword in a second highlight colour."""
@@ -815,15 +814,14 @@ def pick_sessions(
                 button, x, y = key
                 col = x - 1  # 0-based screen column; the rows start three chars in
                 row = y - picker_top - 1 if picker_top is not None else -1
-                hit = next(((attr, label) for start, end, attr, label in spans
+                hit = next((attr for start, end, attr in spans
                             if 3 + start <= col < 3 + end), None)
                 if button == 0 and y == picker_top and hit:
-                    attr, label = hit
-                    if attr == sort_attr:
+                    if hit == sort_attr:
                         reverse = not reverse
                     else:
-                        sort_attr, reverse = attr, False
-                    sort_rows(attr, label)
+                        sort_attr, reverse = hit, False
+                    sort_rows(hit)
                 elif button == 0 and 0 <= row < len(row_map):
                     cur, on_session_row = row_map[row]
                     s = rows[cur]
@@ -845,15 +843,16 @@ def pick_sessions(
                 cur = 0
             elif key == "G":
                 cur = len(rows) - 1
+            elif key in ("\t", "right", "left"):
+                # Cycle the sort through the header columns, TITLE included.
+                attrs = [attr for _, _, attr in spans]
+                i = next((n for n, attr in enumerate(attrs) if attr == sort_attr), -1)
+                step = -1 if key == "left" else 1
+                sort_attr = attrs[(i + step) % len(attrs)]
+                sort_rows(sort_attr)
             elif key == "s":
-                # Cycle the sort through the header columns; a full pass flips
-                # the direction and starts over.
-                attrs = [(attr, label) for _, _, attr, label in spans]
-                i = next((n for n, (attr, _) in enumerate(attrs) if attr == sort_attr), -1)
-                if i + 1 >= len(attrs):
-                    reverse = not reverse
-                sort_attr, label = attrs[(i + 1) % len(attrs)]
-                sort_rows(sort_attr, label)
+                reverse = not reverse
+                sort_rows(sort_attr)
             elif key in ("J", "K", "shift-down", "shift-up"):
                 # Toggle the row you step onto, plus the row you are leaving
                 # when the direction changes (or a run starts): holding the
