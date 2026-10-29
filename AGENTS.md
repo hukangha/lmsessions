@@ -105,10 +105,12 @@ by identity.
 Clicking a row copies the CWD (or, outside that column, the transcript's
 directory).
 
-Returns `(action, payload, current)`:
+Returns `(action, payload, current, sort)` where `sort` is the
+`(attribute, reverse)` the list ended up in:
 `remove`/`dump` → the picker's `marks` (possibly empty; the caller falls back
 to `current`); `resume` → the `Session`; `search` → pattern; `back` → `None`;
-`None` → cancelled.
+`None` → cancelled. Passing `sort` back in re-sorts `rows` to it, so the order
+survives every return to the picker.
 
 ## Menu loop (`interactive_menu`)
 
@@ -116,7 +118,9 @@ Wraps the picker and keeps a `history` stack of
 `(rows, hits, cw, filters, marks)` — one entry per successful search, so `Esc`
 on a search page reopens the page searched from. Additional searches compose:
 `filters` is cumulative (rows must match all regexes, case-insensitive), and
-`hits` shown always come from the latest filter.
+`hits` shown always come from the latest filter. The picker's `sort` is kept
+here and handed back to every picker invocation, so the order survives search,
+back, dump and removal.
 
 After a removal it discards history (it may point at gone sessions) and
 rebuilds `rows` from `all_sessions(cwd)`, reapplying all filters. Confirmation

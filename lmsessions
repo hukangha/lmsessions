@@ -677,15 +677,21 @@ def pick_sessions(
     marks: list[int] | None = None,
     hits: dict[tuple[str, str], list[Hit]] | None = None,
     focus: Session | None = None,
-) -> tuple[str, list[int] | Session | str | None, Session] | None:
+    sort: tuple[str, bool] | None = None,
+) -> tuple[str, list[int] | Session | str | None, Session, tuple[str, bool]] | None:
     """Inline picker drawn below the cursor.
 
     hits maps (agent, id) to matched snippets; when given, snippets are shown
     under each session (all of them for the current or a marked row). focus is
-    the session to highlight on start. Returns (action, payload, current) where
-    action is 'remove'|'dump' (the marked row indexes, possibly empty) on
-    Delete/d, 'resume' (session) on Enter, 'search' (pattern) on / + Enter,
-    'back' (None) on Esc from a search page, or None on q/Esc at the top level."""
+    the session to highlight on start. sort is the (attribute, reverse) the list
+    was last shown in; rows are re-sorted to it when given. Returns
+    (action, payload, current, sort) where action is 'remove'|'dump' (the marked
+    row indexes, possibly empty) on Delete/d, 'resume' (session) on Enter,
+    'search' (pattern) on / + Enter, 'back' (None) on Esc from a search page, or
+    None on q/Esc at the top level."""
+    sort_attr, reverse = sort or ("mtime", False)  # the list starts out oldest first
+    if sort is not None:  # rows may not carry the order the caller was shown
+        rows.sort(key=sort_key(sort_attr), reverse=reverse)
     fd = sys.stdin.fileno()
     out = sys.stdout
     term = shutil.get_terminal_size()
@@ -710,8 +716,6 @@ def pick_sessions(
     shade, match_shade, both_shade = shade_codes()
     spans = header_spans(cw)
     cwd_span = next(((start, end) for start, end, attr in spans if attr == "cwd"), None)
-    sort_attr: str | None = "mtime"  # the list starts out oldest first
-    reverse = False
 
     def content(i: int) -> list[Hit]:
         """Matched snippets shown under row i: all when current or marked, else the first."""
@@ -877,7 +881,7 @@ def pick_sessions(
                     key = read_key(fd)
                     if key in ("\r", "\n"):
                         if pattern:
-                            return "search", pattern, rows[cur]
+                            return "search", pattern, rows[cur], (sort_attr, reverse)
                         break
                     if key in ("esc", "\x0f"):  # Ctrl+O
                         break
@@ -888,13 +892,13 @@ def pick_sessions(
                     elif isinstance(key, str) and len(key) == 1 and key.isprintable():
                         pattern += key
             elif key == "d":
-                return "dump", marks, rows[cur]
+                return "dump", marks, rows[cur], (sort_attr, reverse)
             elif key == "delete":
-                return "remove", marks, rows[cur]
+                return "remove", marks, rows[cur], (sort_attr, reverse)
             elif key in ("\r", "\n"):
-                return "resume", rows[cur], rows[cur]
+                return "resume", rows[cur], rows[cur], (sort_attr, reverse)
             elif key == "esc" and hits is not None:
-                return "back", None, rows[cur]
+                return "back", None, rows[cur], (sort_attr, reverse)
             elif key in ("q", "esc"):
                 return None
     except KeyboardInterrupt:
@@ -1017,12 +1021,13 @@ def interactive_menu(cwd: Path | None) -> int:
         list[Session], dict[tuple[str, str], list[Hit]] | None, int, list[re.Pattern], list[int]
     ]] = []
     focus: Session | None = None
+    sort: tuple[str, bool] | None = None  # kept across pages: backing out restores the order
     while True:
-        action = pick_sessions(rows, cw, marks, hits, focus)
-        if action is None:
+        result = pick_sessions(rows, cw, marks, hits, focus, sort)
+        if result is None:
             print("Cancelled.")
             return 0
-        kind, payload, focus = action
+        kind, payload, focus, sort = result
         if kind == "back":  # Esc on a search page: back to the page searched from
             if history:
                 rows, hits, cw, filters, marks = history.pop()
