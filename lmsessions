@@ -695,7 +695,7 @@ def pick_sessions(
         cur = next(
             (i for i, r in enumerate(rows) if (r.agent, r.id) == (focus.agent, focus.id)), cur
         )
-    footer = "j/k move  / search  Ctrl+f/b page  g/G top/bottom  Shift+j/k select  s toggle  u undo  y copy id  d dump  r remove  Enter resume  q quit  Esc back"
+    footer = "j/k move  / search  Ctrl+f/b page  g/G top/bottom  Shift+j/k select  Space toggle  u undo  y copy id  d dump  r remove  Enter resume  q quit  Esc back"
     status = ""  # footer message, e.g. after yanking an id
     shade, match_shade = shade_codes()
     spans = header_spans(cw)
@@ -821,7 +821,7 @@ def pick_sessions(
                 for i in (prev, cur):  # extend the selection over both ends
                     if i not in marks:
                         marks.append(i)
-            elif key == "s":
+            elif key == " ":
                 if cur in marks:
                     marks.remove(cur)
                 else:
