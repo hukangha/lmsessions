@@ -123,7 +123,10 @@ here and handed back to every picker invocation, so the order survives search,
 back, dump and removal.
 
 After a removal it discards history (it may point at gone sessions) and
-rebuilds `rows` from `all_sessions(cwd)`, reapplying all filters. Confirmation
+rebuilds `rows` with `rebuild_rows()`, reapplying all filters. That helper keeps
+the sessions in the order they were last shown (unseen ones last) rather than
+`all_sessions()`'s oldest-first order, so ties of the sort column do not
+reshuffle after a delete. Confirmation
 (`confirm_remove`) semantics: `Enter` deletes, `Esc` returns with `marks` kept.
 
 ## Terminal plumbing

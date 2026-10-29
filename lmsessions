@@ -1022,6 +1022,15 @@ def interactive_menu(cwd: Path | None) -> int:
     ]] = []
     focus: Session | None = None
     sort: tuple[str, bool] | None = None  # kept across pages: backing out restores the order
+
+    def rebuild_rows() -> list[Session]:
+        """Every session, in the order rows are shown now; unseen ones last.
+
+        A fresh all_sessions() is oldest-first, so re-sorting it by key can put
+        ties in a different order than the list the user was looking at."""
+        seen = {(s.agent, s.id): i for i, s in enumerate(rows)}
+        return sorted(all_sessions(cwd), key=lambda s: seen.get((s.agent, s.id), len(seen)))
+
     while True:
         result = pick_sessions(rows, cw, marks, hits, focus, sort)
         if result is None:
@@ -1032,7 +1041,7 @@ def interactive_menu(cwd: Path | None) -> int:
             if history:
                 rows, hits, cw, filters, marks = history.pop()
             else:  # no page left (e.g. after a removal): drop all filters
-                rows = all_sessions(cwd)
+                rows = rebuild_rows()
                 hits, filters, marks = None, [], []
                 cw = cwd_width(rows, cwd)
             continue
@@ -1068,8 +1077,7 @@ def interactive_menu(cwd: Path | None) -> int:
             continue
         # Removed: pick again from what is left instead of exiting.
         history = []  # its pages may point at removed sessions
-        rows = all_sessions(cwd)
-        rows = [s for s in rows if all(find_hits(s, rx) for rx in filters)]
+        rows = [s for s in rebuild_rows() if all(find_hits(s, rx) for rx in filters)]
         hits = (
             {(s.agent, s.id): find_hits(s, filters[-1]) for s in rows} if filters else None
         )
