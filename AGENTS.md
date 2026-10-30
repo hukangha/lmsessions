@@ -41,8 +41,16 @@ Each implements `sessions(cwd)`, `remove(s)`, `resume(s)`, `transcript(s)`.
   collide in one project dir. Remove = unlink file.
 - **CodexAgent** — `${CODEX_HOME:-~/.codex}/state_5.sqlite`, table `threads`
   (`id, name, title, updated_at(_ms), rollout_path, cwd`). Prompts are counted
-  from `event_msg`/`user_message` records in the rollout JSONL. Remove deletes
-  the thread's rows from every table that has a `thread_id` /
+  from `response_item`/`message` records with role `user` (newer Codex, skipping
+  the `<environment_context>`-style records Codex injects), or from
+  `event_msg`/`user_message` records (older Codex) when a rollout has no
+  `response_item` user message — never both, so the two kinds cannot double
+  count. Old rollouts are stored
+  zstd-compressed: a `rollout_path` whose file is missing is retried as
+  `.jsonl.zst`, which `read_jsonl`/`file_size` decompress (stdlib `compression.zstd`
+  on 3.14+, else the `zstandard` module; without either, that rollout reads
+  empty and its size is the compressed one). Remove deletes the thread's rows
+  from every table that has a `thread_id` /
   `parent_thread_id` / `child_thread_id` column, then the `threads` row, then
   the rollout file. This schema is version-dependent — re-check on Codex
   upgrades.
@@ -110,6 +118,16 @@ header sorts (same header toggles direction); marks and cursor follow sessions
 by identity.
 Clicking a row copies the CWD (or, outside that column, the transcript's
 directory).
+
+Mouse wheel: terminals cannot tell a wheel from a trackpad, so event cadence
+decides. `next_key()` takes a timeout, and a wheel notch (button 64 up, 65
+down) is held for one gap (30 ms): a companion event arriving first makes the
+run a trackpad scroll, the timeout makes the notch a mouse's. A mouse notch
+drags `cur` and leaves scrolling to `frame()` once the highlight would leave
+the body. Trackpad events move `top` and `cur` together, so the highlight keeps
+its row on screen, and stop dead at either end (`bottom_top()` is the lowest
+`top` where the list's tail still fills the body), so the highlight never
+drifts there. Holding each notch costs every notch one gap of latency.
 
 Returns `(action, payload, current, sort)` where `sort` is the
 `(attribute, reverse)` the list ended up in:

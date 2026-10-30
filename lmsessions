@@ -23,6 +23,14 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+try:  # Codex compresses old rollouts to .zst; the stdlib reader arrived in 3.14
+    from compression import zstd
+except ImportError:  # pragma: no cover - depends on the Python version
+    try:
+        import zstandard as zstd
+    except ImportError:
+        zstd = None
+
 
 @dataclass
 class Session:
@@ -41,16 +49,26 @@ Hit = tuple[str, int, int]  # (snippet text, match start, match end within the s
 
 
 def file_size(path: Path) -> int:
-    """Size of a transcript file; zero if it is missing."""
+    """Size of a transcript file, decompressed when it is stored as .zst; zero if it is missing."""
     try:
+        if path.suffix == ".zst":
+            data = path.read_bytes()
+            return len(zstd.decompress(data)) if zstd else len(data)
         return path.stat().st_size
     except FileNotFoundError:
         return 0
 
 
 def read_jsonl(path: Path):
-    with path.open() as f:
-        for line in f:
+    """The transcript's JSON objects, decompressing a .zst rollout on the fly."""
+    if path.suffix == ".zst":
+        if zstd is None:
+            return
+        stream = zstd.open(path, "rt", encoding="utf-8", errors="replace")
+    else:
+        stream = path.open(errors="replace")
+    with stream:
+        for line in stream:
             line = line.strip()
             if not line:
                 continue
@@ -217,20 +235,50 @@ class CodexAgent(Agent):
         out = []
         for sid, name, title, updated_at, updated_at_ms, rollout, scwd in rows:
             path = Path(rollout)
+            if not path.is_file() and Path(f"{rollout}.zst").is_file():
+                path = Path(f"{rollout}.zst")  # Codex compresses old rollouts
             mtime = updated_at_ms / 1000 if updated_at_ms is not None else updated_at
             size = file_size(path)
             title = " ".join((name or title or "").split())
             out.append(Session(self.name, sid, mtime, size, self.user_prompts(path), title, path, scwd))
         return out
 
+    # Records newer Codex versions inject as user messages that the user never typed.
+    SYNTHETIC = ("<environment_context", "<user_instructions", "<external_codex_apps_open_page")
+
+    @staticmethod
+    def modern_prompt(rec: dict) -> str:
+        """Text of a newer Codex user message (`response_item`/`message`/`user`), else ''."""
+        p = rec.get("payload") or {}
+        if rec.get("type") != "response_item" or p.get("type") != "message" or p.get("role") != "user":
+            return ""
+        text = "".join(
+            b.get("text", "") for b in p.get("content") or []
+            if isinstance(b, dict) and b.get("type") in ("input_text", "text")
+        ).strip()
+        return "" if text.startswith(CodexAgent.SYNTHETIC) else text
+
+    @staticmethod
+    def old_prompt(rec: dict) -> str:
+        """Text of an older Codex user message (`event_msg`/`user_message`), else ''."""
+        p = rec.get("payload") or {}
+        if rec.get("type") == "event_msg" and p.get("type") == "user_message":
+            return (p.get("message") or "").strip()
+        return ""
+
     @staticmethod
     def user_prompts(path: Path) -> int:
+        """Prompts the user typed: the newer record kind when the rollout has any,
+        else the older kind, so a rollout carrying both is not counted twice."""
         if not path.is_file():
             return 0
-        return sum(
-            1 for rec in read_jsonl(path)
-            if rec.get("type") == "event_msg" and (rec.get("payload") or {}).get("type") == "user_message"
-        )
+        modern = old = 0
+        for rec in read_jsonl(path):
+            if CodexAgent.modern_prompt(rec):
+                modern += 1
+            elif CodexAgent.old_prompt(rec):
+                old += 1
+        return modern or old
 
     def remove(self, s: Session) -> None:
         conn = sqlite3.connect(self.db)
@@ -259,15 +307,16 @@ class CodexAgent(Agent):
     def transcript(self, s: Session) -> list[Turn]:
         if not s.path.is_file():
             return []
+        # Same rule as user_prompts: take one kind of user record, never both.
+        modern = any(self.modern_prompt(rec) for rec in read_jsonl(s.path))
         turns = []
         for rec in read_jsonl(s.path):
             ts = (rec.get("timestamp") or "")[:19].replace("T", " ")
             p = rec.get("payload") or {}
             typ = p.get("type")
-            if rec.get("type") == "event_msg" and typ == "user_message":
-                body = (p.get("message") or "").strip()
-                if body:
-                    turns.append(("USER", ts, body))
+            body = self.modern_prompt(rec) if modern else self.old_prompt(rec)
+            if body:
+                turns.append(("USER", ts, body))
             elif rec.get("type") != "response_item":
                 continue
             elif typ == "message" and p.get("role") == "assistant":
@@ -794,11 +843,43 @@ def pick_sessions(
         out.flush()
         return row_map
 
-    def next_key() -> str | tuple[int, int, int]:
-        """read_key, but returns 'resize' when a SIGWINCH arrives instead."""
+    def bottom_top() -> int:
+        """The lowest top can reach: the list's tail fills the body."""
+        used, i = 0, len(rows)
+        while i > 0 and used + height(i - 1) <= body:
+            i -= 1
+            used += height(i)
+        return i
+
+    def wheel(button: int, trackpad: bool) -> None:
+        """Scroll one row per wheel notch (button 64 up, 65 down).
+
+        A mouse notch drags the highlight and leaves the scrolling to frame(),
+        which slides the list once the highlight would leave the body. A
+        trackpad event pushes the list instead, the highlight keeping its row
+        on screen, and the list stops dead at either end so the highlight
+        never drifts there."""
+        nonlocal cur, top
+        step = -1 if button == 64 else 1
+        if not trackpad:
+            cur = min(max(cur + step, 0), len(rows) - 1)
+        elif step < 0:
+            if top > 0:  # top <= cur after frame(), so cur keeps its offset
+                top -= 1
+                cur -= 1
+        elif top < bottom_top() and cur < len(rows) - 1:
+            top += 1
+            cur += 1
+
+    def next_key(timeout: float | None = None) -> str | tuple[int, int, int] | None:
+        """read_key, but returns 'resize' when a SIGWINCH arrives instead, and
+        None when timeout seconds pass without input."""
         if _pending:
             return read_key(fd)
-        if fd in select.select([fd, resize_r], [], [])[0]:
+        ready = select.select([fd, resize_r], [], [], timeout)[0]
+        if not ready:
+            return None
+        if fd in ready:
             return read_key(fd)
         try:  # one redraw per burst of resizes: drain the wakeup bytes
             while os.read(resize_r, 64):
@@ -840,15 +921,36 @@ def pick_sessions(
         if picker_top is not None:
             out.write("\x1b[?1000h\x1b[?1006h")  # report clicks in SGR form
             mouse = True
+        held_wheel: int | None = None  # a wheel notch, held until we know its kind
+        held_trackpad = False  # the held notch belongs to a run already judged a trackpad
+        gap = 0.03  # how long to wait for a companion before calling a notch a mouse's
         while True:
             row_map = frame(status or footer)
-            key = next_key()
+            key = next_key(gap if held_wheel is not None else None)
+            if key is None:  # no companion came: the held notch was a mouse wheel
+                wheel(held_wheel, held_trackpad)
+                held_wheel, held_trackpad = None, False
+                continue
             if key == "resize":
                 resize()
                 continue
             status = ""
             if key not in ("J", "K", "shift-down", "shift-up"):
                 shift_dir = None  # any other key ends the current shift run
+            wheel_key = isinstance(key, tuple) and key[0] in (64, 65)
+            if held_wheel is not None and not wheel_key:  # the run ended after all
+                wheel(held_wheel, held_trackpad)
+                held_wheel, held_trackpad = None, False
+            if wheel_key:
+                # A trackpad floods in wheel events a few ms apart where a mouse
+                # wheel sends one notch at a time, so hold each notch for one
+                # gap: a companion arriving first makes it a trackpad event, the
+                # timeout makes it a mouse notch.
+                if held_wheel is not None:
+                    wheel(held_wheel, True)
+                    held_trackpad = True
+                held_wheel = key[0]
+                continue
             if isinstance(key, tuple):
                 button, x, y = key
                 col = x - 1  # 0-based screen column; the rows start three chars in
