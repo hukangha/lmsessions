@@ -145,10 +145,19 @@ class ClaudeAgent(Agent):
     def title_and_cwd(path: Path) -> tuple[str, str, int]:
         """Latest title (a /rename custom title wins over the AI one), or the first
         user prompt when the session has neither; the session's cwd; and how many
-        prompts the user typed."""
+        prompts the user typed. Rewound records are ignored."""
+        records = list(read_jsonl(path))
+        active = claude_active_uuids(records)
         custom = ai = cwd = first = ""
         prompts = 0
-        for entry in read_jsonl(path):
+        for entry in records:
+            if (
+                active is not None
+                and isinstance(entry.get("uuid"), str)
+                and not entry.get("isSidechain")
+                and entry["uuid"] not in active
+            ):
+                continue
             typ = entry.get("type")
             if typ == "custom-title":
                 custom = entry.get("customTitle", "") or custom
@@ -171,8 +180,17 @@ class ClaudeAgent(Agent):
         exec_agent(s, ["claude", "--resume", s.id])
 
     def transcript(self, s: Session) -> list[Turn]:
+        records = list(read_jsonl(s.path))
+        active = claude_active_uuids(records)
         turns = []
-        for rec in read_jsonl(s.path):
+        for rec in records:
+            if (
+                active is not None
+                and isinstance(rec.get("uuid"), str)
+                and not rec.get("isSidechain")
+                and rec["uuid"] not in active
+            ):
+                continue
             typ = rec.get("type")
             if typ not in ("user", "assistant"):
                 continue
@@ -1538,6 +1556,75 @@ def render_turn(view, turn, results, tmpdir, blobs, shapes, by_id, final) -> Non
         render_item(view, final, results, tmpdir, None)
 
 
+def claude_active_uuids(records: list[dict]) -> set[str] | None:
+    """UUIDs on the live branch.
+
+    A rewind leaves the abandoned branch in the jsonl, but its records are not
+    ancestors of the newest conversation record. Follow parentUuid back to the
+    root, using logicalParentUuid to cross a compaction boundary."""
+    by_uuid = {r["uuid"]: r for r in records if isinstance(r.get("uuid"), str)}
+    conv = [
+        (i, r)
+        for i, r in enumerate(records)
+        if isinstance(r.get("uuid"), str)
+        and not r.get("isSidechain")
+        and r.get("type") in ("user", "assistant", "system", "attachment")
+    ]
+    if not conv or not by_uuid:
+        return None
+    last_index, last = conv[-1]
+    leaf = last["uuid"]
+    prompt_index = None
+    prompt_leaf = None
+    for i, rec in enumerate(records):
+        if rec.get("type") == "last-prompt" and isinstance(rec.get("leafUuid"), str):
+            prompt_index, prompt_leaf = i, rec["leafUuid"]
+    # A rewind without a new message makes last-prompt the newest record; its
+    # leafUuid is then the live end, not the abandoned record after it.
+    if prompt_index is not None and prompt_index > last_index and prompt_leaf in by_uuid:
+        leaf = prompt_leaf
+    active: set[str] = set()
+    cur = leaf
+    while cur in by_uuid and cur not in active:
+        active.add(cur)
+        rec = by_uuid[cur]
+        cur = rec.get("parentUuid") or rec.get("logicalParentUuid")
+    return active or None
+
+
+def claude_active_requests(records: list[dict], active: set[str] | None) -> set[int]:
+    """Indexes of api-request records that belong to the live branch.
+
+    An api-request has no uuid; it is logged just before the conversation record
+    it serves, so keep it when the next meaningful record is on the live branch."""
+    if active is None:
+        return {i for i, rec in enumerate(records) if rec.get("type") == "api-request"}
+    next_conv: list[dict | None] = [None] * (len(records) + 1)
+    following: dict | None = None
+    for i in range(len(records) - 1, -1, -1):
+        next_conv[i] = following
+        rec = records[i]
+        if not isinstance(rec.get("uuid"), str) or rec.get("isSidechain"):
+            continue
+        if rec.get("type") not in ("user", "assistant", "system", "attachment"):
+            continue
+        if rec.get("type") == "user":
+            if rec.get("isMeta"):
+                continue
+            text = ClaudeAgent.user_text(rec.get("message") or {})
+            if text.startswith(("<local-command", "<command-name", "<command-message")):
+                continue
+        following = rec
+    live: set[int] = set()
+    for i, rec in enumerate(records):
+        if rec.get("type") != "api-request":
+            continue
+        following = next_conv[i]
+        if following is None or following["uuid"] in active:
+            live.add(i)
+    return live
+
+
 def claude_view(s: Session, view: ViewBuilder, tmpdir: Path) -> None:
     """Render a Claude session into view.
 
@@ -1545,11 +1632,23 @@ def claude_view(s: Session, view: ViewBuilder, tmpdir: Path) -> None:
     system notes, selected injected attachments and API requests. Raw tool
     results, thinking and attachments are what transcript() drops."""
     records = list(read_jsonl(s.path))
+    active = claude_active_uuids(records)
+    live_requests = claude_active_requests(records, active)
+
+    def rewound(rec: dict) -> bool:
+        uuid = rec.get("uuid")
+        return (
+            active is not None
+            and isinstance(uuid, str)
+            and not rec.get("isSidechain")
+            and uuid not in active
+        )
+
     blobs: dict[str, dict] = {}
     shapes: dict[str, dict] = {}
     requests_by_id: dict[str, dict] = {}
     results: dict[str, tuple[dict, dict]] = {}
-    for rec in records:
+    for i, rec in enumerate(records):
         kind = rec.get("type")
         if kind == "api-request-blob":
             if isinstance(rec.get("hash"), str) and isinstance(rec.get("message"), dict):
@@ -1558,10 +1657,13 @@ def claude_view(s: Session, view: ViewBuilder, tmpdir: Path) -> None:
             if isinstance(rec.get("shapeHash"), str) and isinstance(rec.get("shape"), dict):
                 shapes[rec["shapeHash"]] = rec["shape"]
         elif kind == "api-request":
-            request_id = rec.get("id")
-            if isinstance(request_id, str):
-                requests_by_id[request_id] = rec
+            if i in live_requests:
+                request_id = rec.get("id")
+                if isinstance(request_id, str):
+                    requests_by_id[request_id] = rec
         elif kind == "user":
+            if rewound(rec):
+                continue
             for block in content_blocks(rec):
                 if block.get("type") == "tool_result":
                     results[block.get("tool_use_id")] = (block, rec)
@@ -1648,8 +1750,14 @@ def claude_view(s: Session, view: ViewBuilder, tmpdir: Path) -> None:
         turn = new_turn()
         loop = None
 
-    for rec in records:
+    for i, rec in enumerate(records):
         kind = rec.get("type")
+        if kind == "api-request":
+            if i in live_requests:
+                start_loop(rec)
+            continue
+        if rewound(rec):
+            continue
         ts = record_ts(rec)
         tag = "[subagent] " if rec.get("isSidechain") else ""
         if kind == "api-request":

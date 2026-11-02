@@ -60,7 +60,8 @@ Each implements `sessions(cwd)`, `remove(s)`, `resume(s)`, `transcript(s)`.
   size/prompts. Remove = `DELETE FROM session_v2` with foreign keys on.
 - `transcript()` normalizes each agent's format to `(role, ts, body)` with
   tool calls reduced to one-line `tool_marker` text. Raw tool results and
-  reasoning/thinking are dropped.
+  reasoning/thinking are dropped. Claude's transcript also skips records off the
+  live branch (see the viewer section), so search and dump omit rewound content.
 - `resume()` → `exec_agent()`: chdir to the session's `cwd` (if it still
   exists) and `execvp` the agent CLI. It replaces the process, so it never
   returns; `resume_session()` only catches `OSError`.
@@ -122,6 +123,16 @@ middle. `isMeta` user records, synthetic `<local-command…>`/`<command-name…>
 user text, `turn_duration`, most attachment types (`VIEW_ATTACHMENTS` is the
 whitelist) and the duplicated `api-request-blob`/`api-request-shape` records are
 skipped.
+
+A rewind leaves the abandoned branch in the jsonl. `claude_active_uuids()` keeps
+only records on the live branch: start from the newest conversation record (or
+the last-prompt leaf when that record is newer, for a rewind with no new
+message) and follow `parentUuid` to the root, using `logicalParentUuid` to cross
+a compaction boundary. `claude_view()` skips records whose `uuid` is not in that
+set (sidechain records are kept). `claude_active_requests()` does the same for
+API requests, which have no `uuid`: a request is live when the next meaningful
+conversation record is on the live branch. `title_and_cwd()` uses the same
+filter, so the prompt count and fallback title ignore rewound prompts.
 
 `vim_viewer_script()` creates manual folds **innermost-first** (sorted by range
 length): creating an outer fold first makes Vim raise that whole fold's level
