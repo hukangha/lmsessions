@@ -1163,23 +1163,6 @@ VIEW_ATTACHMENTS = {
     "file",
     "queued_command",
 }
-# Records that carry no conversation content: they do not end a run of API requests.
-VIEW_METADATA = {
-    "api-request-blob",
-    "api-request-shape",
-    "last-prompt",
-    "mode",
-    "permission-mode",
-    "atis-latch",
-    "ai-title",
-    "custom-title",
-    "file-history-snapshot",
-    "file-history-delta",
-    "tools-used",
-    "cost-state",
-    "queue-operation",
-    "bridge-session",
-}
 
 
 class ViewBuilder:
@@ -1355,48 +1338,6 @@ def add_call(view, entry, results, tmpdir) -> None:
     view.section(header, body)
 
 
-def flush_group(view, group, results, tmpdir) -> None:
-    """Render a run of tool calls and its thinking, nested inside one fold when there are several."""
-    if not group:
-        return
-    calls = [entry for entry in group if entry["kind"] == "call"]
-    if not calls:  # defensive: a run always starts with a call
-        for entry in group:
-            add_thinking(view, entry)
-        group.clear()
-        return
-    thinking = len(group) - len(calls)
-    if len(group) == 1:
-        add_call(view, calls[0], results, tmpdir)
-    else:
-        names = ", ".join(entry["name"] for entry in calls)
-        if len(names) > 80:
-            names = names[:80] + "…"
-        errors = 0
-        for entry in calls:
-            found = results.get(entry["id"])
-            if found and found[0].get("is_error"):
-                errors += 1
-        header = (
-            f"{group[0]['ts']} {group[0].get('tag', '')}{len(calls)} "
-            f"tool call{'s' if len(calls) != 1 else ''}: {names}"
-        )
-        if thinking:
-            header += f" · {thinking} thinking"
-        if errors:
-            header += f" · {errors} error(s)"
-        start = len(view.lines) + 1
-        view.lines.append(header)
-        for entry in group:
-            if entry["kind"] == "call":
-                add_call(view, entry, results, tmpdir)
-            else:
-                add_thinking(view, entry)
-        view.folds.append((start, len(view.lines)))
-        view.lines.append("")
-    group.clear()
-
-
 def attachment_text(rec: dict) -> str:
     rendered = rec.get("rendered")
     if isinstance(rendered, str):
@@ -1524,17 +1465,77 @@ def render_request(view, rec, blobs, shapes, by_id) -> None:
     )
 
 
-def render_request_run(view, run, blobs, shapes, by_id) -> None:
-    """Consecutive API requests: one fold for the run when there are several."""
-    if len(run) == 1:
-        render_request(view, run[0], blobs, shapes, by_id)
+def render_item(view, item, results, tmpdir, final) -> None:
+    """Render one loop item; the final assistant text is left for render_turn."""
+    if item is final:
         return
+    kind = item["kind"]
+    if kind == "thinking":
+        add_thinking(view, item)
+    elif kind == "call":
+        add_call(view, item, results, tmpdir)
+    elif kind == "text":
+        view.section(
+            f"{item['ts']} {item['tag']}ASSISTANT: {text_preview(item['text'])}",
+            item["text"].splitlines(),
+        )
+    else:  # note
+        view.section(item["header"], item["body"])
+
+
+def render_loop(view, loop, results, tmpdir, blobs, shapes, by_id, final) -> None:
+    """One API-request/thinking/tool-call loop, folded as a block."""
+    requests = loop["requests"]
+    items = loop["items"]
+    thinking = sum(1 for item in items if item["kind"] == "thinking")
+    calls = sum(1 for item in items if item["kind"] == "call")
+    parts = ["API request" if len(requests) == 1 else f"{len(requests)} API requests"]
+    if thinking:
+        parts.append(f"{thinking} thinking")
+    if calls:
+        parts.append(f"{calls} tool call{'s' if calls != 1 else ''}")
+    ts = record_ts(requests[0]) if requests else ""
     start = len(view.lines) + 1
-    view.lines.extend([f"{record_ts(run[0])} API requests ({len(run)})", ""])
-    for rec in run:
+    view.lines.append(f"{ts} LOOP: " + " · ".join(parts))
+    for rec in requests:
         render_request(view, rec, blobs, shapes, by_id)
-    view.folds.append((start, len(view.lines)))
+    for item in items:
+        render_item(view, item, results, tmpdir, final)
+    if len(view.lines) > start:
+        view.folds.append((start, len(view.lines)))
     view.lines.append("")
+
+
+def render_turn(view, turn, results, tmpdir, blobs, shapes, by_id, final) -> None:
+    """USER, its repeated loops (one PROCEDURE fold), then the final ASSISTANT text."""
+    user = turn["user"]
+    if user is not None:
+        view.section(
+            f"{user['ts']} {user['tag']}{user['label']}: {text_preview(user['text'])}",
+            user["text"].splitlines(),
+        )
+    pre = turn["pre"]
+    loops = turn["loops"]
+    if len(loops) > 1 or (loops and pre):
+        start = len(view.lines) + 1
+        ts = record_ts(loops[0]["requests"][0]) if loops and loops[0]["requests"] else ""
+        count = len(loops)
+        view.lines.extend(
+            [f"{ts} PROCEDURE ({count} loop{'s' if count != 1 else ''})", ""]
+        )
+        for item in pre:
+            render_item(view, item, results, tmpdir, final)
+        for loop in loops:
+            render_loop(view, loop, results, tmpdir, blobs, shapes, by_id, final)
+        view.folds.append((start, len(view.lines)))
+        view.lines.append("")
+    else:
+        for item in pre:
+            render_item(view, item, results, tmpdir, final)
+        for loop in loops:
+            render_loop(view, loop, results, tmpdir, blobs, shapes, by_id, final)
+    if final is not None:
+        render_item(view, final, results, tmpdir, None)
 
 
 def claude_view(s: Session, view: ViewBuilder, tmpdir: Path) -> None:
@@ -1574,31 +1575,86 @@ def claude_view(s: Session, view: ViewBuilder, tmpdir: Path) -> None:
             "",
         ]
     )
-    group: list[dict] = []
-    pending_requests: list[dict] = []
+    def new_turn() -> dict:
+        return {"user": None, "pre": [], "loops": [], "last_text": None}
 
-    def flush() -> None:
-        flush_group(view, group, results, tmpdir)
+    turn = new_turn()
+    loop: dict | None = None
 
-    def flush_requests() -> None:
-        if pending_requests:
-            render_request_run(view, pending_requests, blobs, shapes, requests_by_id)
-            pending_requests.clear()
+    def add_item(item: dict) -> None:
+        if loop is not None:
+            loop["items"].append(item)
+        else:
+            turn["pre"].append(item)
+
+    def add_note(header: str, body: list[str]) -> None:
+        add_item({"kind": "note", "header": header, "body": body})
+
+    def add_thinking_item(ts: str, tag: str, label: str, text: str) -> None:
+        add_item({"kind": "thinking", "ts": ts, "tag": tag, "label": label, "text": text})
+
+    def add_call_item(block: dict, ts: str, tag: str) -> None:
+        add_item(call_entry(block, ts, tag))
+
+    def add_text_item(ts: str, tag: str, text: str) -> None:
+        item = {"kind": "text", "ts": ts, "tag": tag, "text": text}
+        add_item(item)
+        turn["last_text"] = item
+
+    def start_loop(rec: dict) -> None:
+        nonlocal loop
+        if loop is None or loop["items"]:
+            loop = {"requests": [], "items": []}
+            turn["loops"].append(loop)
+        loop["requests"].append(rec)
+
+    def final_text_for(turn: dict) -> dict | None:
+        """The last assistant text with no tool call or later loop after it."""
+        last = turn["last_text"]
+        if last is None:
+            return None
+
+        def call_after(items: list[dict]) -> bool:
+            seen = False
+            for item in items:
+                if item is last:
+                    seen = True
+                elif seen and item["kind"] == "call":
+                    return True
+            return False
+
+        if any(item is last for item in turn["pre"]):
+            return None if turn["loops"] or call_after(turn["pre"]) else last
+        for index, loop in enumerate(turn["loops"]):
+            if any(item is last for item in loop["items"]):
+                if call_after(loop["items"]):
+                    return None
+                if any(later["requests"] or later["items"] for later in turn["loops"][index + 1:]):
+                    return None
+                return last
+        return None
+
+    def flush_turn() -> None:
+        nonlocal turn, loop
+        empty = (
+            turn["user"] is None
+            and not turn["pre"]
+            and not turn["loops"]
+            and turn["last_text"] is None
+        )
+        if not empty:
+            final = final_text_for(turn)
+            render_turn(view, turn, results, tmpdir, blobs, shapes, requests_by_id, final)
+        turn = new_turn()
+        loop = None
 
     for rec in records:
         kind = rec.get("type")
-        if kind == "api-request":
-            flush()  # the open tool run happened before this request
-            pending_requests.append(rec)
-            continue
-        if (
-            kind not in VIEW_METADATA
-            and not (kind == "user" and rec.get("isMeta"))
-            and not (kind == "system" and rec.get("subtype") == "turn_duration")
-        ):
-            flush_requests()
         ts = record_ts(rec)
         tag = "[subagent] " if rec.get("isSidechain") else ""
+        if kind == "api-request":
+            start_loop(rec)
+            continue
         if kind == "user":
             if rec.get("isMeta"):
                 continue
@@ -1609,71 +1665,57 @@ def claude_view(s: Session, view: ViewBuilder, tmpdir: Path) -> None:
                 ("<local-command", "<command-name", "<command-message")
             )
             if text and not synthetic:
-                flush()
+                carried = None
+                if turn["loops"]:
+                    trailing = turn["loops"][-1]
+                    last_ts = record_ts(trailing["requests"][-1]) if trailing["requests"] else ""
+                    if not trailing["items"] and last_ts and last_ts == ts:
+                        # The request for this user turn is logged just before it.
+                        carried = turn["loops"].pop()
+                flush_turn()
                 label = "CONTEXT SUMMARY" if rec.get("isCompactSummary") else "USER"
-                view.section(
-                    f"{ts} {tag}{label}: {text_preview(text)}", text.splitlines()
-                )
+                turn["user"] = {"ts": ts, "tag": tag, "label": label, "text": text}
+                if carried is not None:
+                    for request in list(carried["requests"]):
+                        start_loop(request)
             if rec.get("interruptedMessageId"):
-                flush()
-                view.section(f"{ts} {tag}user interrupted", [])
+                add_note(f"{ts} {tag}user interrupted", [])
             continue
         if kind == "assistant":
             msg = rec.get("message")
             msg = msg if isinstance(msg, dict) else {}
             blocks = content_blocks(rec)
             if rec.get("isApiErrorMessage"):
-                flush()
                 text = ClaudeAgent.user_text(msg) or json.dumps(msg, ensure_ascii=False)
-                view.section(f"{ts} {tag}API error", text.splitlines())
+                add_note(f"{ts} {tag}API error", text.splitlines())
                 continue
             for block in blocks:
                 typ = block.get("type")
                 if typ == "text":
                     text = (block.get("text") or "").strip()
                     if text:
-                        flush()
-                        view.section(
-                            f"{ts} {tag}ASSISTANT: {text_preview(text)}",
-                            text.splitlines(),
-                        )
+                        add_text_item(ts, tag, text)
                 elif typ == "thinking":
                     text = (block.get("thinking") or "").strip()
                     label = "thinking"
                     if rec.get("thinkingDisplay") == "summarized":
                         label += " (summarized)"
-                    entry = {
-                        "kind": "thinking",
-                        "ts": ts,
-                        "tag": tag,
-                        "label": label,
-                        "text": text,
-                    }
-                    if group:  # stays inside this run, so one fold hides it with the calls
-                        group.append(entry)
-                    else:
-                        add_thinking(view, entry)
+                    add_thinking_item(ts, tag, label, text)
                 elif typ == "tool_use":
-                    group.append(call_entry(block, ts, tag))
+                    add_call_item(block, ts, tag)
                 elif typ == "image":
-                    flush()
-                    view.section(f"{ts} {tag}image", ["[image]"])
+                    add_note(f"{ts} {tag}image", ["[image]"])
                 else:
-                    flush()
-                    view.section(
+                    add_note(
                         f"{ts} {tag}{typ or 'block'}",
                         [json.dumps(block, ensure_ascii=False)],
                     )
             if not blocks:
                 text = ClaudeAgent.user_text(msg).strip()
                 if text:
-                    flush()
-                    view.section(
-                        f"{ts} {tag}ASSISTANT: {text_preview(text)}", text.splitlines()
-                    )
+                    add_text_item(ts, tag, text)
             if rec.get("error") or rec.get("apiErrorStatus"):
-                flush()
-                view.section(
+                add_note(
                     f"{ts} {tag}API error",
                     [str(rec.get("error") or rec.get("apiErrorStatus"))],
                 )
@@ -1684,16 +1726,12 @@ def claude_view(s: Session, view: ViewBuilder, tmpdir: Path) -> None:
                 continue
             content = rec.get("content")
             if subtype == "compact_boundary":
-                flush()
                 body = [str(content)] if content else []
                 meta = rec.get("compactMetadata")
                 if isinstance(meta, dict) and meta:
                     body.append(json.dumps(meta, ensure_ascii=False))
-                view.section(
-                    f"{ts} {tag}context compacted", body or ["Conversation compacted"]
-                )
+                add_note(f"{ts} {tag}context compacted", body or ["Conversation compacted"])
             elif content:
-                flush()
                 level = rec.get("level") or "info"
                 labels = {
                     "away_summary": "away summary",
@@ -1706,7 +1744,7 @@ def claude_view(s: Session, view: ViewBuilder, tmpdir: Path) -> None:
                     match = re.search(r"<command-name>([^<]+)</command-name>", str(content))
                     if match:
                         label = f"command {match.group(1)}"
-                view.section(f"{ts} {tag}{label}", str(content).splitlines())
+                add_note(f"{ts} {tag}{label}", str(content).splitlines())
             continue
         if kind == "attachment":
             attachment = rec.get("attachment")
@@ -1717,14 +1755,12 @@ def claude_view(s: Session, view: ViewBuilder, tmpdir: Path) -> None:
                 continue
             text = attachment_text(rec)
             if text:
-                flush()
-                view.section(
+                add_note(
                     f"{ts} {tag}attachment: {attachment.get('type')}",
                     text.splitlines(),
                 )
             continue
-    flush()
-    flush_requests()
+    flush_turn()
 
 
 def vim_viewer_script(folds: list[tuple[int, int]]) -> str:

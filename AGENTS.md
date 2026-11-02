@@ -98,25 +98,30 @@ toggles a fold.
 
 `claude_view()` parses the records itself rather than reusing `transcript()`,
 because that deliberately drops thinking, tool results and injected context.
-USER/ASSISTANT fold headers carry a preview of the body (first two sentences or
-100 characters). Consecutive tool calls in one assistant run (including the
-thinking between them) become one `N tool calls` fold, with each call and
-thinking block as a nested fold. Results pair with calls by `tool_use_id`;
+It buffers one turn between user messages and renders a hierarchy of **loop** and
+**procedure** folds: a loop is an API request followed by its thinking, tool
+calls, interim assistant text and notes; repeated loops in a turn share one
+`PROCEDURE (N loops)` fold, while a single loop stays top-level (unless pre-loop
+items exist, which are folded with it). The final assistant text — the last one
+with no tool call or later loop after it (`final_text_for`) — is rendered after
+the procedure, so the buffer reads USER → PROCEDURE/LOOP → ASSISTANT. A trailing
+request-only loop is carried into the following user turn when its timestamp
+matches that user record: Claude logs a turn's API request just before its user
+message. USER/ASSISTANT fold headers carry a preview of the body (first two
+sentences or 100 characters). Results pair with calls by `tool_use_id`;
 `toolUseResult` wins over the model-visible `tool_result` text (Edit/Write
 `structuredPatch` as a unified diff, Bash `stdout`/`stderr`, Read
 `file.content`, WebFetch `result`). A tool output longer than
 `CLAUDE_VIEW_LINES` (300) shows that many lines and writes the whole text to a
 temp file, whose path is the last line (`gf` opens it). System notes cover
 compaction, slash commands, warnings, API errors, user interrupts and
-permission denials; sidechain records are prefixed `[subagent]`. `api-request`
-records are rendered where they occur, so they sit among the messages by time;
-only a run of consecutive requests shares one local `API requests (N)` fold
-(`VIEW_METADATA` records do not break a run). Each request shows params, a shape
-summary and the head/tail of its content (the `base` chain supplies the first
-messages), with `......` eliding the middle. `isMeta` user records, synthetic
-`<local-command…>`/`<command-name…>` user text, `turn_duration`, most attachment
-types (`VIEW_ATTACHMENTS` is the whitelist) and the duplicated
-`api-request-blob`/`api-request-shape` records are skipped.
+permission denials; sidechain records are prefixed `[subagent]`. Each
+`api-request` shows params, a shape summary and the head/tail of its content
+(the `base` chain supplies the first messages), with `......` eliding the
+middle. `isMeta` user records, synthetic `<local-command…>`/`<command-name…>`
+user text, `turn_duration`, most attachment types (`VIEW_ATTACHMENTS` is the
+whitelist) and the duplicated `api-request-blob`/`api-request-shape` records are
+skipped.
 
 `vim_viewer_script()` creates manual folds **innermost-first** (sorted by range
 length): creating an outer fold first makes Vim raise that whole fold's level
