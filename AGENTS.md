@@ -1,9 +1,9 @@
 # lmsessions — code map for agents
 
 Single executable Python 3.10+ script (`./lmsessions`, stdlib only). Lists,
-searches, dumps, removes and resumes coding-agent sessions (Claude Code, Codex,
-OpenCode), either as a plain list or an inline interactive picker. No tests, no
-build step; verify by running it.
+searches, views, dumps, removes and resumes coding-agent sessions (Claude Code,
+Codex, OpenCode), either as a plain list or an inline interactive picker. No
+tests, no build step; verify by running it.
 
 ## Entry point
 
@@ -86,6 +86,43 @@ click spans are unaffected.
   Left/Right move the text cursor, Enter dumps, Esc backs out); backing out
   keeps the selection.
 
+## Session viewer (`v`, Claude only)
+
+`v` on a Claude row returns `("view", session, ...)`. `view_session()` renders
+the JSONL into a temp file and runs `vim` on it; the picker has already restored
+the terminal by then, and the caller re-enters it with the same sort, marks and
+focus afterwards. The temp dir is removed when vim exits. The buffer is readonly
+with every section folded (`foldmethod=manual`, `foldcolumn=1`, `normal! zM`);
+`za`/`zo`/`zc`, clicking the fold column or double-clicking a section header
+toggles a fold.
+
+`claude_view()` parses the records itself rather than reusing `transcript()`,
+because that deliberately drops thinking, tool results and injected context.
+USER/ASSISTANT fold headers carry a preview of the body (first two sentences or
+100 characters). Consecutive tool calls in one assistant run (including the
+thinking between them) become one `N tool calls` fold, with each call and
+thinking block as a nested fold. Results pair with calls by `tool_use_id`;
+`toolUseResult` wins over the model-visible `tool_result` text (Edit/Write
+`structuredPatch` as a unified diff, Bash `stdout`/`stderr`, Read
+`file.content`, WebFetch `result`). A tool output longer than
+`CLAUDE_VIEW_LINES` (300) shows that many lines and writes the whole text to a
+temp file, whose path is the last line (`gf` opens it). System notes cover
+compaction, slash commands, warnings, API errors, user interrupts and
+permission denials; sidechain records are prefixed `[subagent]`. `api-request`
+records are rendered where they occur, so they sit among the messages by time;
+only a run of consecutive requests shares one local `API requests (N)` fold
+(`VIEW_METADATA` records do not break a run). Each request shows params, a shape
+summary and the head/tail of its content (the `base` chain supplies the first
+messages), with `......` eliding the middle. `isMeta` user records, synthetic
+`<local-command…>`/`<command-name…>` user text, `turn_duration`, most attachment
+types (`VIEW_ATTACHMENTS` is the whitelist) and the duplicated
+`api-request-blob`/`api-request-shape` records are skipped.
+
+`vim_viewer_script()` creates manual folds **innermost-first** (sorted by range
+length): creating an outer fold first makes Vim raise that whole fold's level
+for every range nested in it. `view_session()` sets `nomodeline` in `--cmd` and
+again before `:edit`, so transcript text cannot run as a modeline.
+
 ## Interactive picker (`pick_sessions`) — the bulk of the code
 
 Draws an inline TUI below the cursor using absolute-position writes: one fixed
@@ -112,8 +149,9 @@ toggles the sort direction,
 `J/K`/Shift-arrows toggle the row stepped onto, plus the row being left when the
 run starts or reverses direction (so holding it toggles a run and reversing
 un-toggles it back; at a list end a held key does nothing), `Space` toggle the
-current row, `y` copy id, `/` incremental search, `d` dump, `Delete` remove,
-`Enter` resume, `q` quit, `Esc` quit (or back when `hits` set). Clicking a
+current row, `y` copy id, `/` incremental search, `d` dump, `v` open the session
+viewer (Claude only), `Delete` remove, `Enter` resume, `q` quit, `Esc` quit (or
+back when `hits` set). Clicking a
 header sorts (same header toggles direction); marks and cursor follow sessions
 by identity.
 Clicking a row copies the CWD (or, outside that column, the transcript's
@@ -132,9 +170,9 @@ drifts there. Holding each notch costs every notch one gap of latency.
 Returns `(action, payload, current, sort)` where `sort` is the
 `(attribute, reverse)` the list ended up in:
 `remove`/`dump` → the picker's `marks` (possibly empty; the caller falls back
-to `current`); `resume` → the `Session`; `search` → pattern; `back` → `None`;
-`None` → cancelled. Passing `sort` back in re-sorts `rows` to it, so the order
-survives every return to the picker.
+to `current`); `resume`/`view` → the `Session`; `search` → pattern; `back` →
+`None`; `None` → cancelled. Passing `sort` back in re-sorts `rows` to it, so the
+order survives every return to the picker.
 
 ## Menu loop (`interactive_menu`)
 

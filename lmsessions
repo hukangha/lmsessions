@@ -17,6 +17,7 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import termios
 import tty
 from dataclasses import dataclass
@@ -737,8 +738,8 @@ def pick_sessions(
     was last shown in; rows are re-sorted to it when given. Returns
     (action, payload, current, sort) where action is 'remove'|'dump' (the marked
     row indexes, possibly empty) on Delete/d, 'resume' (session) on Enter,
-    'search' (pattern) on / + Enter, 'back' (None) on Esc from a search page, or
-    None on q/Esc at the top level."""
+    'view' (session) on v, 'search' (pattern) on / + Enter, 'back' (None) on Esc
+    from a search page, or None on q/Esc at the top level."""
     sort_attr, reverse = sort or ("mtime", False)  # the list starts out oldest first
     if sort is not None:  # rows may not carry the order the caller was shown
         rows.sort(key=sort_key(sort_attr), reverse=reverse)
@@ -759,7 +760,7 @@ def pick_sessions(
     quit_hint = "quit:q back:Esc" if hits is not None else "quit:q/Esc"
     footer = (
         "move:j/k,↓/↑ search:/ page:Ctrl+f/b top/bottom:g/G title:←→/Tab sort:s toggle:Shift+j/k,Space"
-        f" copy-id:y dump:d delete:del goto:Enter {quit_hint}"
+        f" copy-id:y dump:d view:v delete:del goto:Enter {quit_hint}"
     )
     status = ""  # footer message, e.g. after yanking an id
     shift_dir: int | None = None  # direction of the current Shift+j/k run
@@ -1031,6 +1032,11 @@ def pick_sessions(
                         pattern = ""
                     elif isinstance(key, str) and len(key) == 1 and key.isprintable():
                         pattern += key
+            elif key == "v":
+                if rows[cur].agent != "claude":
+                    status = "The vim viewer supports Claude sessions only"
+                else:
+                    return "view", rows[cur], rows[cur], (sort_attr, reverse)
             elif key == "d":
                 return "dump", marks, rows[cur], (sort_attr, reverse)
             elif key == "delete":
@@ -1149,6 +1155,650 @@ def dump_selected(rows: list[Session]) -> bool:
     return True
 
 
+CLAUDE_VIEW_LINES = 300  # a longer tool output shows this many lines; the rest is spilled to a file
+VIEW_ATTACHMENTS = {
+    "instructions",
+    "hook_additional_context",
+    "edited_text_file",
+    "file",
+    "queued_command",
+}
+# Records that carry no conversation content: they do not end a run of API requests.
+VIEW_METADATA = {
+    "api-request-blob",
+    "api-request-shape",
+    "last-prompt",
+    "mode",
+    "permission-mode",
+    "atis-latch",
+    "ai-title",
+    "custom-title",
+    "file-history-snapshot",
+    "file-history-delta",
+    "tools-used",
+    "cost-state",
+    "queue-operation",
+    "bridge-session",
+}
+
+
+class ViewBuilder:
+    """Viewer text plus the 1-based (start, end) line ranges to fold."""
+
+    def __init__(self):
+        self.lines: list[str] = []
+        self.folds: list[tuple[int, int]] = []
+        self.spills = 0
+
+    def section(self, header: str, body: list[str]) -> None:
+        start = len(self.lines) + 1
+        self.lines.append(header)
+        self.lines.extend(body)
+        if body:
+            self.folds.append((start, len(self.lines)))
+        self.lines.append("")
+
+
+def record_ts(rec: dict) -> str:
+    ts = rec.get("timestamp")
+    return ts[:19].replace("T", " ") if isinstance(ts, str) else ""
+
+
+def text_preview(text: str) -> str:
+    """The first two sentences or 100 characters, whichever ends first, on one line."""
+    flat = " ".join(text.split())
+    end = len(flat)
+    sentences = 0
+    for i, char in enumerate(flat):
+        if char in ".!?。！？":
+            sentences += 1
+            if sentences == 2:
+                end = i + 1
+                break
+    end = min(end, 100)
+    return flat[:end].rstrip() + ("…" if end < len(flat) else "")
+
+
+def content_blocks(rec: dict) -> list[dict]:
+    """The record's content blocks when content is a list (Claude's usual shape)."""
+    message = rec.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    return [b for b in content if isinstance(b, dict)] if isinstance(content, list) else []
+
+
+def text_of(content) -> str:
+    """Readable text of a tool_result content value (a string or a list of blocks)."""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return "" if content is None else str(content)
+    parts = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "text":
+            parts.append(block.get("text", ""))
+        elif block.get("type") == "image":
+            parts.append("[image]")
+        else:
+            parts.append(json.dumps(block, ensure_ascii=False))
+    return "\n".join(parts)
+
+
+def structured_patch(tur: dict) -> str:
+    """A unified diff from an Edit/Write toolUseResult, or ''."""
+    patch = tur.get("structuredPatch")
+    if not isinstance(patch, list) or not patch:
+        return ""
+    path = tur.get("filePath") or ""
+    out = [f"--- {path}", f"+++ {path}"] if path else []
+    for hunk in patch:
+        if not isinstance(hunk, dict):
+            continue
+        out.append(
+            f"@@ -{hunk.get('oldStart')},{hunk.get('oldLines')}"
+            f" +{hunk.get('newStart')},{hunk.get('newLines')} @@"
+        )
+        out.extend(str(line) for line in hunk.get("lines") or [])
+    return "\n".join(out)
+
+
+def tool_text(rec: dict, block: dict) -> str:
+    """Prefer the structured toolUseResult over the model-visible tool_result text."""
+    fallback = text_of(block.get("content"))
+    tur = rec.get("toolUseResult")
+    if tur is None:
+        return fallback
+    if isinstance(tur, str):
+        return tur
+    if not isinstance(tur, dict):
+        return fallback or json.dumps(tur, ensure_ascii=False)
+    patch = structured_patch(tur)
+    if patch:
+        return patch
+    if "stdout" in tur or "stderr" in tur:
+        parts = []
+        if tur.get("interrupted"):
+            parts.append("[interrupted]")
+        if tur.get("stderr"):
+            parts.append(str(tur["stderr"]).rstrip())
+        if tur.get("stdout"):
+            parts.append(str(tur["stdout"]).rstrip())
+        return "\n".join(parts) or fallback or "(no output)"
+    if isinstance(tur.get("result"), str):
+        return tur["result"]
+    file = tur.get("file")
+    if isinstance(file, dict) and isinstance(file.get("content"), str):
+        return file["content"]
+    return fallback or json.dumps(tur, ensure_ascii=False)
+
+
+def input_lines(inp) -> list[str]:
+    """A tool_use input as readable key/value lines, keeping multi-line strings multi-line."""
+    if not isinstance(inp, dict) or not inp:
+        return ["(none)"]
+    out = []
+    for key, value in inp.items():
+        if isinstance(value, str) and "\n" in value:
+            out.append(f"{key}:")
+            out.extend(value.splitlines())
+        else:
+            out.append(f"{key}: {json.dumps(value, ensure_ascii=False)}")
+    return out
+
+
+def spill_lines(view: ViewBuilder, text: str, tmpdir: Path) -> list[str]:
+    """The first CLAUDE_VIEW_LINES lines; a longer text is written whole to a file for gf."""
+    lines = text.splitlines()
+    if len(lines) <= CLAUDE_VIEW_LINES:
+        return lines or ["(no output)"]
+    view.spills += 1
+    path = tmpdir / f"output-{view.spills:03d}.txt"
+    path.write_text(text.rstrip("\n") + "\n", encoding="utf-8")
+    return lines[:CLAUDE_VIEW_LINES] + [f"full output ({len(lines)} lines): {path}"]
+
+
+def call_entry(block: dict, ts: str, tag: str) -> dict:
+    inp = block.get("input")
+    return {
+        "kind": "call",
+        "id": block.get("id"),
+        "name": block.get("name") or "?",
+        "input": inp if isinstance(inp, dict) else {"input": inp},
+        "ts": ts,
+        "tag": tag,
+    }
+
+
+def add_thinking(view, entry) -> None:
+    view.section(
+        f"{entry['ts']} {entry.get('tag', '')}{entry['label']}",
+        entry["text"].splitlines() or ["(no text)"],
+    )
+
+
+def add_call(view, entry, results, tmpdir) -> None:
+    block, rec = results.get(entry["id"], (None, None))
+    failed = bool(block and block.get("is_error"))
+    denied = rec.get("toolDenialKind") if rec else None
+    mark = "✗ " if failed or denied else ""
+    header = f"{entry['ts']} {entry.get('tag', '')}{mark}{tool_marker(entry['name'], entry['input']).strip()}"
+    body = ["input:"]
+    body.extend(input_lines(entry["input"]))
+    if block is None:
+        body.append("(no result)")
+    else:
+        if denied:
+            body.append(f"denied: {denied}")
+        body.append("result:")
+        body.extend(spill_lines(view, tool_text(rec, block), tmpdir))
+    view.section(header, body)
+
+
+def flush_group(view, group, results, tmpdir) -> None:
+    """Render a run of tool calls and its thinking, nested inside one fold when there are several."""
+    if not group:
+        return
+    calls = [entry for entry in group if entry["kind"] == "call"]
+    if not calls:  # defensive: a run always starts with a call
+        for entry in group:
+            add_thinking(view, entry)
+        group.clear()
+        return
+    thinking = len(group) - len(calls)
+    if len(group) == 1:
+        add_call(view, calls[0], results, tmpdir)
+    else:
+        names = ", ".join(entry["name"] for entry in calls)
+        if len(names) > 80:
+            names = names[:80] + "…"
+        errors = 0
+        for entry in calls:
+            found = results.get(entry["id"])
+            if found and found[0].get("is_error"):
+                errors += 1
+        header = (
+            f"{group[0]['ts']} {group[0].get('tag', '')}{len(calls)} "
+            f"tool call{'s' if len(calls) != 1 else ''}: {names}"
+        )
+        if thinking:
+            header += f" · {thinking} thinking"
+        if errors:
+            header += f" · {errors} error(s)"
+        start = len(view.lines) + 1
+        view.lines.append(header)
+        for entry in group:
+            if entry["kind"] == "call":
+                add_call(view, entry, results, tmpdir)
+            else:
+                add_thinking(view, entry)
+        view.folds.append((start, len(view.lines)))
+        view.lines.append("")
+    group.clear()
+
+
+def attachment_text(rec: dict) -> str:
+    rendered = rec.get("rendered")
+    if isinstance(rendered, str):
+        return rendered.strip()
+    if isinstance(rendered, dict):
+        rendered = [rendered]
+    if not isinstance(rendered, list):
+        return ""
+    parts = []
+    for item in rendered:
+        if isinstance(item, dict) and isinstance(item.get("content"), str):
+            parts.append(item["content"])
+        elif isinstance(item, str):
+            parts.append(item)
+    return "\n".join(parts).strip()
+
+
+def head_tail(lines: list[str], n: int) -> list[str]:
+    """The first and last n lines, with the elided middle replaced by six dots."""
+    return lines if len(lines) <= 2 * n else lines[:n] + ["......"] + lines[-n:]
+
+
+def message_summary(message: dict) -> str:
+    """One line naming a request message and enough text to place it."""
+    if not isinstance(message, dict):
+        return "?: (not an object)"
+    role = message.get("role") or "?"
+    content = message.get("content")
+    if isinstance(content, str):
+        text = content
+    elif isinstance(content, list):
+        parts = []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            kind = block.get("type")
+            if kind == "text":
+                parts.append(block.get("text", ""))
+            elif kind == "tool_use":
+                parts.append(f"[tool_use {block.get('name') or '?'}]")
+            elif kind == "tool_result":
+                snippet = " ".join(text_of(block.get("content")).split())[:80]
+                parts.append(f"[tool_result {snippet}]" if snippet else "[tool_result]")
+            elif kind == "thinking":
+                parts.append("[thinking]")
+            else:
+                parts.append(f"[{kind or 'block'}]")
+        text = " ".join(parts)
+    else:
+        text = str(content or "")
+    text = " ".join(text.split()) or "(empty)"
+    return f"{role}: {text[:160]}{'…' if len(text) > 160 else ''}"
+
+
+def render_request(view, rec, blobs, shapes, by_id) -> None:
+    """One folded section for an API request: shape plus the head/tail of its content."""
+
+    def messages(hashes):
+        if not isinstance(hashes, list):
+            return []
+        return [blobs[h] for h in hashes if h in blobs]
+
+    def first_messages(request_id):
+        """The earliest content in the request's base chain, so the range is visible."""
+        chain, seen, cur = [], set(), request_id
+        while cur and cur in by_id and cur not in seen:
+            chain.append(cur)
+            seen.add(cur)
+            cur = by_id[cur].get("base")
+        for item in reversed(chain):
+            found = messages(by_id[item].get("tail"))
+            if found:
+                return found
+        return []
+
+    params = rec.get("params")
+    params = params if isinstance(params, dict) else {}
+    tail = messages(rec.get("tail"))
+    base = rec.get("base")
+    base = base if isinstance(base, str) else None
+    head = first_messages(base) if base else []
+    body = ["params:"]
+    body.extend(json.dumps(params, ensure_ascii=False, indent=2).splitlines())
+    shape_hash = rec.get("shapeHash")
+    shape = shapes.get(shape_hash) if isinstance(shape_hash, str) else None
+    shape = shape if isinstance(shape, dict) else {}
+    system = shape.get("system") or []
+    tools = shape.get("tools") or []
+    body.append(
+        f"shape {(shape_hash or '')[:8]}:" f" system={len(system)} tool(s)={len(tools)}"
+    )
+    system_text = "\n".join(
+        block.get("text", "") for block in system if isinstance(block, dict)
+    )
+    if system_text.strip():
+        body.append("system:")
+        body.extend(head_tail(system_text.splitlines(), 5))
+    if tools:
+        names = [tool.get("name") or "?" for tool in tools if isinstance(tool, dict)]
+        body.append("tools: " + ", ".join(names))
+    if head and tail:
+        body.append("content from the first request to this one:")
+        body.extend(message_summary(message) for message in head[:3])
+        body.append("......")
+        body.extend(message_summary(message) for message in tail[-3:])
+    elif head:
+        body.append("content (carried over; no new messages):")
+        body.extend(message_summary(message) for message in head[:3])
+        body.append("......")
+    elif tail:
+        body.append("content:")
+        if len(tail) > 6:
+            body.extend(message_summary(message) for message in tail[:3])
+            body.append("......")
+            body.extend(message_summary(message) for message in tail[-3:])
+        else:
+            body.extend(message_summary(message) for message in tail)
+    else:
+        body.append("content: (none)")
+    base_label = f" base={(base or '')[:8]}" if base else ""
+    view.section(
+        f"{record_ts(rec)} API request model={params.get('model', '?')}"
+        f"{base_label} tail={len(tail)}",
+        body,
+    )
+
+
+def render_request_run(view, run, blobs, shapes, by_id) -> None:
+    """Consecutive API requests: one fold for the run when there are several."""
+    if len(run) == 1:
+        render_request(view, run[0], blobs, shapes, by_id)
+        return
+    start = len(view.lines) + 1
+    view.lines.extend([f"{record_ts(run[0])} API requests ({len(run)})", ""])
+    for rec in run:
+        render_request(view, rec, blobs, shapes, by_id)
+    view.folds.append((start, len(view.lines)))
+    view.lines.append("")
+
+
+def claude_view(s: Session, view: ViewBuilder, tmpdir: Path) -> None:
+    """Render a Claude session into view.
+
+    Shows user/assistant text, thinking, grouped tool calls with their results,
+    system notes, selected injected attachments and API requests. Raw tool
+    results, thinking and attachments are what transcript() drops."""
+    records = list(read_jsonl(s.path))
+    blobs: dict[str, dict] = {}
+    shapes: dict[str, dict] = {}
+    requests_by_id: dict[str, dict] = {}
+    results: dict[str, tuple[dict, dict]] = {}
+    for rec in records:
+        kind = rec.get("type")
+        if kind == "api-request-blob":
+            if isinstance(rec.get("hash"), str) and isinstance(rec.get("message"), dict):
+                blobs[rec["hash"]] = rec["message"]
+        elif kind == "api-request-shape":
+            if isinstance(rec.get("shapeHash"), str) and isinstance(rec.get("shape"), dict):
+                shapes[rec["shapeHash"]] = rec["shape"]
+        elif kind == "api-request":
+            request_id = rec.get("id")
+            if isinstance(request_id, str):
+                requests_by_id[request_id] = rec
+        elif kind == "user":
+            for block in content_blocks(rec):
+                if block.get("type") == "tool_result":
+                    results[block.get("tool_use_id")] = (block, rec)
+
+    title = " ".join((s.title or "").split()) or s.id
+    view.lines.extend(
+        [
+            title,
+            f"claude · {s.id} · {s.cwd}",
+            "fold: za/zo/zc or click the fold column · full output: gf on its path",
+            "",
+        ]
+    )
+    group: list[dict] = []
+    pending_requests: list[dict] = []
+
+    def flush() -> None:
+        flush_group(view, group, results, tmpdir)
+
+    def flush_requests() -> None:
+        if pending_requests:
+            render_request_run(view, pending_requests, blobs, shapes, requests_by_id)
+            pending_requests.clear()
+
+    for rec in records:
+        kind = rec.get("type")
+        if kind == "api-request":
+            flush()  # the open tool run happened before this request
+            pending_requests.append(rec)
+            continue
+        if (
+            kind not in VIEW_METADATA
+            and not (kind == "user" and rec.get("isMeta"))
+            and not (kind == "system" and rec.get("subtype") == "turn_duration")
+        ):
+            flush_requests()
+        ts = record_ts(rec)
+        tag = "[subagent] " if rec.get("isSidechain") else ""
+        if kind == "user":
+            if rec.get("isMeta"):
+                continue
+            msg = rec.get("message")
+            msg = msg if isinstance(msg, dict) else {}
+            text = ClaudeAgent.user_text(msg)
+            synthetic = text.startswith(
+                ("<local-command", "<command-name", "<command-message")
+            )
+            if text and not synthetic:
+                flush()
+                label = "CONTEXT SUMMARY" if rec.get("isCompactSummary") else "USER"
+                view.section(
+                    f"{ts} {tag}{label}: {text_preview(text)}", text.splitlines()
+                )
+            if rec.get("interruptedMessageId"):
+                flush()
+                view.section(f"{ts} {tag}user interrupted", [])
+            continue
+        if kind == "assistant":
+            msg = rec.get("message")
+            msg = msg if isinstance(msg, dict) else {}
+            blocks = content_blocks(rec)
+            if rec.get("isApiErrorMessage"):
+                flush()
+                text = ClaudeAgent.user_text(msg) or json.dumps(msg, ensure_ascii=False)
+                view.section(f"{ts} {tag}API error", text.splitlines())
+                continue
+            for block in blocks:
+                typ = block.get("type")
+                if typ == "text":
+                    text = (block.get("text") or "").strip()
+                    if text:
+                        flush()
+                        view.section(
+                            f"{ts} {tag}ASSISTANT: {text_preview(text)}",
+                            text.splitlines(),
+                        )
+                elif typ == "thinking":
+                    text = (block.get("thinking") or "").strip()
+                    label = "thinking"
+                    if rec.get("thinkingDisplay") == "summarized":
+                        label += " (summarized)"
+                    entry = {
+                        "kind": "thinking",
+                        "ts": ts,
+                        "tag": tag,
+                        "label": label,
+                        "text": text,
+                    }
+                    if group:  # stays inside this run, so one fold hides it with the calls
+                        group.append(entry)
+                    else:
+                        add_thinking(view, entry)
+                elif typ == "tool_use":
+                    group.append(call_entry(block, ts, tag))
+                elif typ == "image":
+                    flush()
+                    view.section(f"{ts} {tag}image", ["[image]"])
+                else:
+                    flush()
+                    view.section(
+                        f"{ts} {tag}{typ or 'block'}",
+                        [json.dumps(block, ensure_ascii=False)],
+                    )
+            if not blocks:
+                text = ClaudeAgent.user_text(msg).strip()
+                if text:
+                    flush()
+                    view.section(
+                        f"{ts} {tag}ASSISTANT: {text_preview(text)}", text.splitlines()
+                    )
+            if rec.get("error") or rec.get("apiErrorStatus"):
+                flush()
+                view.section(
+                    f"{ts} {tag}API error",
+                    [str(rec.get("error") or rec.get("apiErrorStatus"))],
+                )
+            continue
+        if kind == "system":
+            subtype = rec.get("subtype")
+            if subtype == "turn_duration":
+                continue
+            content = rec.get("content")
+            if subtype == "compact_boundary":
+                flush()
+                body = [str(content)] if content else []
+                meta = rec.get("compactMetadata")
+                if isinstance(meta, dict) and meta:
+                    body.append(json.dumps(meta, ensure_ascii=False))
+                view.section(
+                    f"{ts} {tag}context compacted", body or ["Conversation compacted"]
+                )
+            elif content:
+                flush()
+                level = rec.get("level") or "info"
+                labels = {
+                    "away_summary": "away summary",
+                    "local_command": "command",
+                    "informational": "warning" if level == "warning" else f"info ({level})",
+                    "bridge_status": "bridge",
+                }
+                label = labels.get(subtype, f"system/{subtype}")
+                if subtype == "local_command":
+                    match = re.search(r"<command-name>([^<]+)</command-name>", str(content))
+                    if match:
+                        label = f"command {match.group(1)}"
+                view.section(f"{ts} {tag}{label}", str(content).splitlines())
+            continue
+        if kind == "attachment":
+            attachment = rec.get("attachment")
+            if (
+                not isinstance(attachment, dict)
+                or attachment.get("type") not in VIEW_ATTACHMENTS
+            ):
+                continue
+            text = attachment_text(rec)
+            if text:
+                flush()
+                view.section(
+                    f"{ts} {tag}attachment: {attachment.get('type')}",
+                    text.splitlines(),
+                )
+            continue
+    flush()
+    flush_requests()
+
+
+def vim_viewer_script(folds: list[tuple[int, int]]) -> str:
+    """Vimscript that folds each range and starts with every fold closed.
+
+    Manual folds must be made innermost-first: creating an outer range first
+    makes Vim raise that whole fold's level for each range nested in it."""
+    setup = [
+        "set nomodeline",
+        "set mouse=a",
+        "setlocal foldmethod=manual",
+        "setlocal foldenable",
+        "setlocal foldminlines=0",
+        "setlocal foldcolumn=1",
+        "setlocal nobuflisted",
+        "setlocal noswapfile",
+        "setlocal wrap",
+        "setlocal linebreak",
+    ]
+    create = [
+        f"{start},{end}fold"
+        for start, end in sorted(folds, key=lambda fold: fold[1] - fold[0])
+    ]
+    finish = [
+        "normal! zM",
+        "setlocal nomodifiable",
+        "setlocal readonly",
+        "nnoremap <buffer> <silent> <2-LeftMouse> za",
+    ]
+    return "\n".join(setup + create + finish) + "\n"
+
+
+def view_session(s: Session) -> None:
+    """Render a Claude session and open it in vim with every section folded."""
+    vim = shutil.which("vim") or shutil.which("nvim")
+    if vim is None:
+        print("vim not found; cannot open the viewer", file=sys.stderr)
+        return
+    tmpdir = Path(tempfile.mkdtemp(prefix="lmsessions-"))
+    try:
+        view = ViewBuilder()
+        try:
+            claude_view(s, view, tmpdir)
+        except OSError as e:  # the transcript vanished or the spill file cannot be written
+            print(f"Cannot read {s.path}: {e}", file=sys.stderr)
+            return
+        name = re.sub(r"[^\w.-]", "_", s.id)
+        content = tmpdir / f"{name}.txt"
+        content.write_text("\n".join(view.lines) + "\n", encoding="utf-8")
+        script = tmpdir / "view.vim"
+        script.write_text(vim_viewer_script(view.folds), encoding="utf-8")
+        # Switch modelines off after the vimrc and before :edit, so a transcript
+        # line that happens to look like one cannot run as an option command.
+        try:
+            subprocess.run(
+                [
+                    vim,
+                    "-N",
+                    "--cmd",
+                    "set nomodeline",
+                    "-c",
+                    "set nomodeline",
+                    "-c",
+                    f"edit {content}",
+                    "-S",
+                    str(script),
+                ]
+            )
+        except OSError as e:
+            print(f"Cannot run {vim}: {e}", file=sys.stderr)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def interactive_menu(cwd: Path | None) -> int:
     if not sys.stdin.isatty():
         print("The interactive menu needs a terminal; pass -l to list sessions.", file=sys.stderr)
@@ -1205,6 +1855,9 @@ def interactive_menu(cwd: Path | None) -> int:
             hits = {(s.agent, s.id): h for s, h in found}
             cw = cwd_width(rows, cwd)
             marks = []
+            continue
+        if kind == "view":
+            view_session(payload)
             continue
         if isinstance(payload, Session):
             return resume_session(payload)
