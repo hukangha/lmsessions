@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """List, search, remove, dump or resume coding-agent sessions (Claude Code,
-Codex, OpenCode). With no arguments, open the interactive menu; -l lists them
-instead; -a covers every directory, not just $PWD. Press / in the menu to search.
+Codex, OpenCode, Antigravity). With no arguments, open the interactive menu; -l
+lists them instead; -a covers every directory, not just $PWD. Press / in the
+menu to search.
 
 To support another agent, subclass `Agent` and add an instance to `AGENTS`.
 """
@@ -21,8 +22,9 @@ import tempfile
 import termios
 import tty
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import unquote, urlparse
 
 try:  # Codex compresses old rollouts to .zst; the stdlib reader arrived in 3.14
     from compression import zstd
@@ -99,6 +101,8 @@ def exec_agent(s: Session, argv: list[str]) -> None:
 
 class Agent:
     name: str
+    removable = True
+    viewable = True
 
     def sessions(self, cwd: Path | None) -> list[Session]:
         """Sessions started in cwd, or in any directory if cwd is None."""
@@ -483,7 +487,174 @@ class OpenCodeAgent(Agent):
         return datetime.fromtimestamp(created / 1000).strftime("%Y-%m-%d %H:%M:%S")
 
 
-AGENTS: list[Agent] = [ClaudeAgent(), CodexAgent(), OpenCodeAgent()]
+class AgyAgent(Agent):
+    """Google Antigravity CLI (`agy`).
+
+    Conversation metadata lives in one SQLite summary table; each conversation's
+    full transcript is a JSONL log under brain/<id>/ (the per-conversation .db
+    is the fallback when that log is missing). The vim viewer is not implemented
+    yet."""
+
+    name = "agy"
+    viewable = False
+
+    def __init__(self):
+        self.home = Path.home() / ".gemini" / "antigravity-cli"
+        self.db = self.home / "conversation_summaries.db"
+        self.conversations = self.home / "conversations"
+        self.brain = self.home / "brain"
+
+    def sessions(self, cwd: Path | None) -> list[Session]:
+        if not self.db.is_file():
+            return []
+        try:
+            conn = sqlite3.connect(self.db.resolve().as_uri() + "?mode=ro", uri=True, timeout=5)
+            try:
+                rows = conn.execute(
+                    "SELECT conversation_id, title, preview, last_modified_time, workspace_uris"
+                    " FROM conversation_summaries"
+                ).fetchall()
+            finally:
+                conn.close()
+        except sqlite3.DatabaseError:
+            return []
+        target = os.path.realpath(cwd) if cwd is not None else None
+        out = []
+        for sid, title, preview, modified, uris in rows:
+            scwd = self.workspace(uris)
+            if target and scwd and os.path.realpath(scwd) != target:
+                continue
+            log = self.log_path(sid)
+            path = log if log.is_file() else self.conversations / f"{sid}.db"
+            fallback, prompts = self.title_and_prompts(log)
+            mtime = self.epoch(modified)
+            if mtime <= 0:  # Antigravity stores a zero time as year 1
+                mtime = path.stat().st_mtime if path.exists() else 0.0
+            title = " ".join((title or preview or fallback).split())
+            out.append(Session(self.name, sid, mtime, file_size(path), prompts, title, path, scwd))
+        return out
+
+    def log_path(self, sid: str) -> Path:
+        return self.brain / sid / ".system_generated" / "logs" / "transcript.jsonl"
+
+    @staticmethod
+    def workspace(uris: str) -> str:
+        """Path of the conversation's primary workspace from its JSON URI list."""
+        try:
+            items = json.loads(uris or "")
+        except (json.JSONDecodeError, TypeError):
+            return ""
+        for uri in items if isinstance(items, list) else []:
+            if isinstance(uri, str):
+                parsed = urlparse(uri)
+                return unquote(parsed.path) if parsed.scheme == "file" else uri
+        return ""
+
+    @staticmethod
+    def epoch(stamp: str) -> float:
+        """Seconds since the epoch from the summary's ISO timestamp (UTC); 0 if unusable."""
+        m = re.match(r"(\d{4}-\d\d-\d\d)[T ](\d\d:\d\d:\d\d)(?:\.(\d+))?", stamp or "")
+        if not m:
+            return 0.0
+        try:
+            dt = datetime.strptime(f"{m.group(1)} {m.group(2)}", "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            return 0.0
+        fraction = int((m.group(3) or "0")[:6].ljust(6, "0")) / 1e6
+        return dt.replace(tzinfo=timezone.utc).timestamp() + fraction
+
+    @staticmethod
+    def user_request(content: str) -> str:
+        """The text the user typed, without the metadata Antigravity appends to it."""
+        m = re.search(r"<USER_REQUEST>(.*?)</USER_REQUEST>", content or "", re.S)
+        return (m.group(1) if m else content).strip()
+
+    @classmethod
+    def title_and_prompts(cls, path: Path) -> tuple[str, int]:
+        """First user prompt (as a fallback title) and how many prompts the session has."""
+        if not path.is_file():
+            return "", 0
+        first = ""
+        prompts = 0
+        for rec in read_jsonl(path):
+            if rec.get("type") != "USER_INPUT":
+                continue
+            text = " ".join(cls.user_request(rec.get("content") or "").split())
+            if text:
+                prompts += 1
+                first = first or text
+        title = first[:60] + "…" if len(first) > 60 else first
+        return title, prompts
+
+    def remove(self, s: Session) -> None:
+        """Delete the summary row and the conversation's own brain/, conversation
+        db and annotation files."""
+        if self.db.is_file():
+            conn = sqlite3.connect(self.db, timeout=10)
+            try:
+                conn.execute("DELETE FROM conversation_summaries WHERE conversation_id = ?", (s.id,))
+                conn.commit()
+            finally:
+                conn.close()
+        shutil.rmtree(self.brain / s.id, ignore_errors=True)
+        for suffix in ("", "-shm", "-wal"):
+            (self.conversations / f"{s.id}.db{suffix}").unlink(missing_ok=True)
+        (self.home / "annotations" / f"{s.id}.pbtxt").unlink(missing_ok=True)
+
+    def resume(self, s: Session) -> None:
+        exec_agent(s, ["agy", "--conversation", s.id])
+
+    def transcript(self, s: Session) -> list[Turn]:
+        log = self.log_path(s.id)
+        if not log.is_file():
+            return []
+        turns = []
+        for rec in read_jsonl(log):
+            typ = rec.get("type")
+            ts = (rec.get("created_at") or "")[:19].replace("T", " ")
+            if typ == "USER_INPUT":
+                body = self.user_request(rec.get("content") or "")
+                if body:
+                    turns.append(("USER", ts, body))
+            elif typ == "PLANNER_RESPONSE":
+                lines = []
+                text = (rec.get("content") or "").strip()
+                if text:
+                    lines.append(text)
+                lines.extend(self.marker(c) for c in rec.get("tool_calls") or [] if isinstance(c, dict))
+                if lines:
+                    turns.append(("ASSISTANT", ts, "\n".join(lines)))
+        return turns
+
+    # The log JSON-encodes every tool argument, and Antigravity's argument names
+    # differ from the ones tool_marker() knows.
+    ARG_KEYS = {
+        "commandline": "command",
+        "absolutepath": "file_path",
+        "path": "file_path",
+        "targetfile": "file_path",
+        "directorypath": "path",
+        "query": "query",
+        "prompt": "prompt",
+        "message": "input",
+        "action": "input",
+    }
+
+    @classmethod
+    def marker(cls, call: dict) -> str:
+        args = {}
+        raw = call.get("args")
+        for key, value in (raw.items() if isinstance(raw, dict) else ()):
+            if isinstance(value, str):
+                try:
+                    value = json.loads(value)
+                except json.JSONDecodeError:
+                    pass
+            args.setdefault(cls.ARG_KEYS.get(key.lower(), key.lower()), value)
+        return tool_marker(call.get("name") or "?", args)
+
+
+AGENTS: list[Agent] = [ClaudeAgent(), CodexAgent(), OpenCodeAgent(), AgyAgent()]
 AGENT_WIDTH = max(len(a.name) for a in AGENTS)
 
 
@@ -1071,7 +1242,9 @@ def pick_sessions(
                     elif isinstance(key, str) and len(key) == 1 and key.isprintable():
                         pattern += key
             elif key == "v":
-                return "view", rows[cur], rows[cur], (sort_attr, reverse)
+                if agent_of(rows[cur]).viewable:
+                    return "view", rows[cur], rows[cur], (sort_attr, reverse)
+                status = f"The viewer does not support {rows[cur].agent} sessions yet"
             elif key == "d":
                 return "dump", marks, rows[cur], (sort_attr, reverse)
             elif key == "delete":
@@ -2257,6 +2430,10 @@ def interactive_menu(cwd: Path | None) -> int:
                 marks = payload  # back to the picker, selection kept
                 continue
             marks = []
+            continue
+        blocked = next((s for s in targets if not agent_of(s).removable), None)
+        if blocked:
+            print(f"Removing {blocked.agent} sessions is not supported yet.")
             continue
         result = confirm_remove(targets, cwd)
         if result == "back":

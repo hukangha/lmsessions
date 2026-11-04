@@ -2,8 +2,8 @@
 
 Single executable Python 3.10+ script (`./lmsessions`, stdlib only). Lists,
 searches, views, dumps, removes and resumes coding-agent sessions (Claude Code,
-Codex, OpenCode), either as a plain list or an inline interactive picker. No
-tests, no build step; verify by running it.
+Codex, OpenCode, Google Antigravity), either as a plain list or an inline
+interactive picker. No tests, no build step; verify by running it.
 
 ## Entry point
 
@@ -22,7 +22,8 @@ turns on the CWD column.
 ## Data model
 
 - `Session(agent, id, mtime, size, prompts, title, path, cwd)` — one row.
-  `path` is the transcript file (or the opencode db for opencode).
+  `path` is the transcript file (the opencode db for opencode, the Antigravity
+  transcript log or conversation db for agy).
 - `Turn = (role, timestamp, body)`; `Hit = (snippet, match_start, match_end)`.
 - `all_sessions(cwd)` merges every `Agent` in `AGENTS`, sorted by mtime
   **oldest first**.
@@ -31,7 +32,9 @@ turns on the CWD column.
 
 Each implements `sessions(cwd)`, `remove(s)`, `resume(s)`, `transcript(s)` and
 `view(s, view, tmpdir)` (the vim viewer). `agent_of(s)` looks one up by
-`s.agent` name.
+`s.agent` name. `removable` / `viewable` are class flags (default True); agy
+turns `viewable` off, and the picker/menu show a "not supported yet" message
+instead of calling that method.
 
 - **ClaudeAgent** — `~/.claude/projects/<project>/*.jsonl`, where `<project>` is
   the cwd with every non-alphanumeric char replaced by `-` (`project_name`).
@@ -59,6 +62,26 @@ Each implements `sessions(cwd)`, `remove(s)`, `resume(s)`, `transcript(s)` and
   Read-only by default (`URI ?mode=ro`); `connect(readonly=False)` only for
   removal. `session_v2` left-joins an aggregate over `session_message` for
   size/prompts. Remove = `DELETE FROM session_v2` with foreign keys on.
+- **AgyAgent** (Google Antigravity CLI, `agy`) —
+  `~/.gemini/antigravity-cli/conversation_summaries.db`, read-only, one row per
+  conversation: `conversation_id, title, preview, last_modified_time,
+  workspace_uris`. `workspace_uris` is a JSON list of `file://` URIs; the first
+  is the session cwd. `preview` holds the generated title when `title` is empty,
+  else the first `USER_INPUT` prompt is the fallback. Prompts are counted from
+  `brain/<id>/.system_generated/logs/transcript.jsonl`; a conversation without
+  that log has no transcript, prompts or fallback title, and uses its `.db` for
+  `path`/size (some subagent conversations are like this). That log is also the
+  transcript source:
+  `USER_INPUT` records carry the prompt inside `<USER_REQUEST>…</USER_REQUEST>`
+  (metadata after it is dropped), and `PLANNER_RESPONSE` records carry assistant
+  text plus `tool_calls`; tool-result record types are skipped. Tool args are
+  JSON-encoded strings and use Antigravity's own names (`CommandLine`,
+  `AbsolutePath`, …), so `ARG_KEYS` renames them for `tool_marker`. Resume =
+  `agy --conversation <id>`. Remove deletes the summary row, the
+  `brain/<id>/` directory, `conversations/<id>.db` (and its `-shm`/`-wal`
+  files) and `annotations/<id>.pbtxt`. The viewer is not implemented
+  (`viewable` False). This layout is version-dependent — re-check on `agy`
+  upgrades.
 - `transcript()` normalizes each agent's format to `(role, ts, body)` with
   tool calls reduced to one-line `tool_marker` text. Raw tool results and
   reasoning/thinking are dropped. Claude's transcript also skips records off the
@@ -90,7 +113,8 @@ click spans are unaffected.
 
 ## Session viewer (`v`)
 
-`v` returns `("view", session, ...)` for every agent. `view_session()` calls
+`v` returns `("view", session, ...)` for every viewable agent (not agy, which
+shows a message in the picker). `view_session()` calls
 `agent_of(s).view()`, which fills a `ViewBuilder` (lines plus fold ranges); it
 writes that into a temp file and runs `vim` on it; the picker has already
 restored the terminal by then, and the caller re-enters it with the same sort,
