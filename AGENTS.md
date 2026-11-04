@@ -29,8 +29,9 @@ turns on the CWD column.
 
 ## Agents (`Agent` subclasses, one instance each in `AGENTS`)
 
-Each implements `sessions(cwd)`, `remove(s)`, `resume(s)`, `transcript(s)`.
-`agent_of(s)` looks one up by `s.agent` name.
+Each implements `sessions(cwd)`, `remove(s)`, `resume(s)`, `transcript(s)` and
+`view(s, view, tmpdir)` (the vim viewer). `agent_of(s)` looks one up by
+`s.agent` name.
 
 - **ClaudeAgent** — `~/.claude/projects/<project>/*.jsonl`, where `<project>` is
   the cwd with every non-alphanumeric char replaced by `-` (`project_name`).
@@ -87,28 +88,51 @@ click spans are unaffected.
   Left/Right move the text cursor, Enter dumps, Esc backs out); backing out
   keeps the selection.
 
-## Session viewer (`v`, Claude only)
+## Session viewer (`v`)
 
-`v` on a Claude row returns `("view", session, ...)`. `view_session()` renders
-the JSONL into a temp file and runs `vim` on it; the picker has already restored
-the terminal by then, and the caller re-enters it with the same sort, marks and
-focus afterwards. The temp dir is removed when vim exits. The buffer is readonly
-with every section folded (`foldmethod=manual`, `foldcolumn=1`, `normal! zM`);
+`v` returns `("view", session, ...)` for every agent. `view_session()` calls
+`agent_of(s).view()`, which fills a `ViewBuilder` (lines plus fold ranges); it
+writes that into a temp file and runs `vim` on it; the picker has already
+restored the terminal by then, and the caller re-enters it with the same sort,
+marks and focus afterwards. The temp dir is removed when vim exits. The buffer
+is readonly with every section folded (`foldmethod=manual`, `foldcolumn=1`,
+`normal! zM`);
 `za`/`zo`/`zc`, clicking the fold column or double-clicking a section header
 toggles a fold.
 
+`message_section()` and `tool_section()` build the shared USER/ASSISTANT/
+THINKING and tool-call folds; `view_header()` writes the title block.
+
+All three views feed `TurnBuilder`, so they share one turn shape:
+`render_turn()` writes USER, wraps repeated loops (and any items before the
+first response) in one PROCEDURE fold, and renders the final ASSISTANT text
+after it. `final_text_for()` picks that text — the last one with no tool call
+or later loop after it — and a loop that would be empty once the text is hoisted
+does not count. A loop is one model response: for Claude an API request and what
+it emitted, for Codex the response items up to the following tool outputs, for
+OpenCode one assistant message. `render_loop()` labels the loop with its
+request/thinking/tool-call counts, or its assistant-text count when it has
+neither.
+
+`codex_view()` walks a rollout's records in order: user prompts (one kind, never
+both `response_item`/`message` and `event_msg`/`user_message`, as in
+`transcript`), reasoning summaries, `function_call`/`custom_tool_call`/
+`web_search_call` with outputs paired by `call_id`, and assistant `output_text`.
+The duplicate `event_msg` records, `token_count`, turn context and developer
+messages are skipped; `turn_aborted` and error events become notes.
+
+`opencode_view()` walks `session_message` rows via `OpenCodeAgent.messages()`:
+`user` text, then an assistant message's content parts — `reasoning`, `text`
+and `tool`, where a tool part carries its own input and result state (status
+`error` is marked `✗`), so no pairing pass is needed. `compaction` and `system`
+rows become notes; `idle` and `synthetic` rows carry no conversation text.
+
 `claude_view()` parses the records itself rather than reusing `transcript()`,
 because that deliberately drops thinking, tool results and injected context.
-It buffers one turn between user messages and renders a hierarchy of **loop** and
-**procedure** folds: a loop is an API request followed by its thinking, tool
-calls, interim assistant text and notes; repeated loops in a turn share one
-`PROCEDURE (N loops)` fold, while a single loop stays top-level (unless pre-loop
-items exist, which are folded with it). The final assistant text — the last one
-with no tool call or later loop after it (`final_text_for`) — is rendered after
-the procedure, so the buffer reads USER → PROCEDURE/LOOP → ASSISTANT. A trailing
-request-only loop is carried into the following user turn when its timestamp
-matches that user record: Claude logs a turn's API request just before its user
-message. USER/ASSISTANT fold headers carry a preview of the body (first two
+Each API request opens a loop, and consecutive requests with no items between
+them share it. A trailing request-only loop is carried into the following user
+turn when its timestamp matches that user record: Claude logs a turn's API
+request just before its user message. USER/ASSISTANT fold headers carry a preview of the body (first two
 sentences or 100 characters). Results pair with calls by `tool_use_id`;
 `toolUseResult` wins over the model-visible `tool_result` text (Edit/Write
 `structuredPatch` as a unified diff, Bash `stdout`/`stderr`, Read
@@ -160,13 +184,13 @@ State: `cur`, `top`, `marks` (row indexes), `status`, `sort_attr`/`reverse`,
 `hits`, `focus` (session to re-highlight when returning from a sub-action).
 
 Keys: `j/k`/up/down arrows move, `Ctrl+f/b` page, `g/G` first/last,
-`Tab`/`→`/`←` cycle the sort through the header columns (TITLE included), `s`
-toggles the sort direction,
+`Tab`/`→`/`l` cycle the sort through the header columns (TITLE included) and
+`Shift+Tab`/`←`/`h` cycle it backwards, `s` toggles the sort direction,
 `J/K`/Shift-arrows toggle the row stepped onto, plus the row being left when the
 run starts or reverses direction (so holding it toggles a run and reversing
 un-toggles it back; at a list end a held key does nothing), `Space` toggle the
 current row, `y` copy id, `/` incremental search, `d` dump, `v` open the session
-viewer (Claude only), `Delete` remove, `Enter` resume, `q` quit, `Esc` quit (or
+viewer, `Delete` remove, `Enter` resume, `q` quit, `Esc` quit (or
 back when `hits` set). Clicking a
 header sorts (same header toggles direction); marks and cursor follow sessions
 by identity.
@@ -211,7 +235,7 @@ list (clamped to the last row) instead of jumping to the top. Confirmation
 ## Terminal plumbing
 
 - `read_key(fd)` disambiguates bare Esc from escape sequences by waiting 25 ms;
-  decodes arrows and Left/Right, Shift-arrows, Delete, and SGR mouse
+  decodes arrows and Left/Right, Shift-arrows, Shift+Tab, Delete, and SGR mouse
   `ESC [ < b ; x ; y M` into a tuple. Unknown sequences return `""`. Bytes read
   while probing replies are stashed in `_pending` (`read_byte`).
 - `terminal_color(ps)` asks the terminal for colour 10 (fg) or 11 (bg) via OSC;
@@ -235,6 +259,6 @@ list (clamped to the last row) instead of jumping to the top. Confirmation
 - Removal is immediate and permanent (no trash/undo).
 - `interactive_menu` requires a tty; otherwise it prints a hint and exits 1.
 - Only documented behavior: sessions are sorted by mtime ascending (oldest at
-  top) unless the user clicks a header, presses `Tab`/`→`/`←` (cycles columns)
-  or `s` (toggles direction) (the header then shows the sorted column and
-  direction).
+  top) unless the user clicks a header, presses `Tab`/`→`/`l` or
+  `Shift+Tab`/`←`/`h` (cycles columns) or `s` (toggles direction) (the header
+  then shows the sorted column and direction).

@@ -114,6 +114,10 @@ class Agent:
         """User text, assistant text and one-line tool markers, in order."""
         raise NotImplementedError
 
+    def view(self, s: Session, view: "ViewBuilder", tmpdir: Path) -> None:
+        """Render s into the viewer's buffer as folded sections."""
+        raise NotImplementedError
+
 
 class ClaudeAgent(Agent):
     name = "claude"
@@ -178,6 +182,9 @@ class ClaudeAgent(Agent):
 
     def resume(self, s: Session) -> None:
         exec_agent(s, ["claude", "--resume", s.id])
+
+    def view(self, s: Session, view: "ViewBuilder", tmpdir: Path) -> None:
+        claude_view(s, view, tmpdir)
 
     def transcript(self, s: Session) -> list[Turn]:
         records = list(read_jsonl(s.path))
@@ -323,6 +330,9 @@ class CodexAgent(Agent):
     def resume(self, s: Session) -> None:
         exec_agent(s, ["codex", "resume", s.id])
 
+    def view(self, s: Session, view: "ViewBuilder", tmpdir: Path) -> None:
+        codex_view(s, view, tmpdir)
+
     def transcript(self, s: Session) -> list[Turn]:
         if not s.path.is_file():
             return []
@@ -413,7 +423,11 @@ class OpenCodeAgent(Agent):
     def resume(self, s: Session) -> None:
         exec_agent(s, ["opencode", "--session", s.id])
 
-    def transcript(self, s: Session) -> list[Turn]:
+    def view(self, s: Session, view: "ViewBuilder", tmpdir: Path) -> None:
+        opencode_view(self, s, view, tmpdir)
+
+    def messages(self, s: Session) -> list[tuple[str, dict]]:
+        """The session's (type, data) messages in seq order; empty when the db is unavailable."""
         if not self.db.is_file():
             return []
         try:
@@ -427,12 +441,17 @@ class OpenCodeAgent(Agent):
                 conn.close()
         except sqlite3.DatabaseError:
             return []
-        turns = []
+        out = []
         for typ, raw in rows:
             try:
-                data = json.loads(raw)
+                out.append((typ, json.loads(raw)))
             except json.JSONDecodeError:
                 continue
+        return out
+
+    def transcript(self, s: Session) -> list[Turn]:
+        turns = []
+        for typ, data in self.messages(s):
             ts = self.timestamp(data.get("time") or {})
             if typ == "user":
                 body = (data.get("text") or "").strip()
@@ -719,12 +738,12 @@ def read_key(fd: int) -> str | tuple[int, int, int]:
         return ch.decode(errors="replace")
     # A bare Esc has nothing following it; keys arrive as CSI/SS3 sequences:
     # ESC [ A / ESC O A (up), ESC [ 1 ; 2 A (shift-up), ESC [ a (rxvt shift-up),
-    # ESC [ C / ESC [ D (right/left), ESC [ 3 ~ (Delete),
+    # ESC [ C / ESC [ D (right/left), ESC [ Z (shift-tab), ESC [ 3 ~ (Delete),
     # ESC [ < button ; x ; y M (SGR mouse press).
     seq = b""
     while _pending or select.select([fd], [], [], 0.025)[0]:
         seq += read_byte(fd)
-        if len(seq) > 1 and seq[-1:] in b"ABCDMmab~":
+        if len(seq) > 1 and seq[-1:] in b"ABCDMmabZ~":
             break
     if not seq:
         return "esc"
@@ -736,6 +755,7 @@ def read_key(fd: int) -> str | tuple[int, int, int]:
         b"[C": "right", b"OC": "right", b"[D": "left", b"OD": "left",
         b"[1;2A": "shift-up", b"[1;2B": "shift-down",
         b"[a": "shift-up", b"[b": "shift-down",
+        b"[Z": "shift-tab",
         b"[3~": "delete",
     }.get(seq, "")
 
@@ -777,7 +797,7 @@ def pick_sessions(
         )
     quit_hint = "quit:q back:Esc" if hits is not None else "quit:q/Esc"
     footer = (
-        "move:j/k,↓/↑ search:/ page:Ctrl+f/b top/bottom:g/G title:←→/Tab sort:s toggle:Shift+j/k,Space"
+        "move:j/k,↓/↑ search:/ page:Ctrl+f/b top/bottom:g/G title:h/l,←→/Tab sort:s toggle:Shift+j/k,Space"
         f" copy-id:y dump:d view:v delete:del goto:Enter {quit_hint}"
     )
     status = ""  # footer message, e.g. after yanking an id
@@ -1003,11 +1023,11 @@ def pick_sessions(
                 cur = 0
             elif key == "G":
                 cur = len(rows) - 1
-            elif key in ("\t", "right", "left"):
+            elif key in ("\t", "shift-tab", "right", "l", "left", "h"):
                 # Cycle the sort through the header columns, TITLE included.
                 attrs = [attr for _, _, attr in spans]
                 i = next((n for n, attr in enumerate(attrs) if attr == sort_attr), -1)
-                step = -1 if key == "left" else 1
+                step = -1 if key in ("left", "h", "shift-tab") else 1
                 sort_attr = attrs[(i + step) % len(attrs)]
                 sort_rows(sort_attr)
             elif key == "s":
@@ -1051,10 +1071,7 @@ def pick_sessions(
                     elif isinstance(key, str) and len(key) == 1 and key.isprintable():
                         pattern += key
             elif key == "v":
-                if rows[cur].agent != "claude":
-                    status = "The vim viewer supports Claude sessions only"
-                else:
-                    return "view", rows[cur], rows[cur], (sort_attr, reverse)
+                return "view", rows[cur], rows[cur], (sort_attr, reverse)
             elif key == "d":
                 return "dump", marks, rows[cur], (sort_attr, reverse)
             elif key == "delete":
@@ -1319,16 +1336,38 @@ def spill_lines(view: ViewBuilder, text: str, tmpdir: Path) -> list[str]:
     return lines[:CLAUDE_VIEW_LINES] + [f"full output ({len(lines)} lines): {path}"]
 
 
-def call_entry(block: dict, ts: str, tag: str) -> dict:
-    inp = block.get("input")
-    return {
-        "kind": "call",
-        "id": block.get("id"),
-        "name": block.get("name") or "?",
-        "input": inp if isinstance(inp, dict) else {"input": inp},
-        "ts": ts,
-        "tag": tag,
-    }
+def message_section(view, ts: str, tag: str, label: str, text: str) -> None:
+    """A USER/ASSISTANT/THINKING fold whose header previews the first two sentences."""
+    view.section(f"{ts} {tag}{label}: {text_preview(text)}", text.splitlines())
+
+
+def tool_section(view, ts: str, tag: str, name: str, inp: dict, output: str | None,
+                 tmpdir: Path, failed: bool = False, denied: str | None = None) -> None:
+    """A tool call fold: its input, then the result (None when no result was logged)."""
+    mark = "✗ " if failed or denied else ""
+    header = f"{ts} {tag}{mark}{tool_marker(name, inp).strip()}"
+    body = ["input:"]
+    body.extend(input_lines(inp))
+    if output is None:
+        body.append("(no result)")
+    else:
+        if denied:
+            body.append(f"denied: {denied}")
+        body.append("result:")
+        body.extend(spill_lines(view, output, tmpdir))
+    view.section(header, body)
+
+
+def view_header(view, s: Session) -> None:
+    title = " ".join((s.title or "").split()) or s.id
+    view.lines.extend(
+        [
+            title,
+            f"{s.agent} · {s.id} · {s.cwd}",
+            "fold: za/zo/zc or click the fold column · full output: gf on its path",
+            "",
+        ]
+    )
 
 
 def add_thinking(view, entry) -> None:
@@ -1336,24 +1375,6 @@ def add_thinking(view, entry) -> None:
         f"{entry['ts']} {entry.get('tag', '')}{entry['label']}",
         entry["text"].splitlines() or ["(no text)"],
     )
-
-
-def add_call(view, entry, results, tmpdir) -> None:
-    block, rec = results.get(entry["id"], (None, None))
-    failed = bool(block and block.get("is_error"))
-    denied = rec.get("toolDenialKind") if rec else None
-    mark = "✗ " if failed or denied else ""
-    header = f"{entry['ts']} {entry.get('tag', '')}{mark}{tool_marker(entry['name'], entry['input']).strip()}"
-    body = ["input:"]
-    body.extend(input_lines(entry["input"]))
-    if block is None:
-        body.append("(no result)")
-    else:
-        if denied:
-            body.append(f"denied: {denied}")
-        body.append("result:")
-        body.extend(spill_lines(view, tool_text(rec, block), tmpdir))
-    view.section(header, body)
 
 
 def attachment_text(rec: dict) -> str:
@@ -1483,7 +1504,97 @@ def render_request(view, rec, blobs, shapes, by_id) -> None:
     )
 
 
-def render_item(view, item, results, tmpdir, final) -> None:
+def new_turn() -> dict:
+    """One user turn: items before its first response, response loops, last text."""
+    return {"user": None, "pre": [], "loops": [], "last_text": None}
+
+
+class TurnBuilder:
+    """Builds a turn from any agent's stream.
+
+    A loop is one model response. Items added before the first response, or
+    before a loop starts, go to `pre`; text items are remembered so
+    final_text_for() can hoist the answer out of the procedure."""
+
+    def __init__(self):
+        self.turn = new_turn()
+        self.loop: dict | None = None
+
+    def add_item(self, item: dict) -> None:
+        if self.loop is not None:
+            self.loop["items"].append(item)
+        else:
+            self.turn["pre"].append(item)
+
+    def add_note(self, header: str, body: list[str]) -> None:
+        self.add_item({"kind": "note", "header": header, "body": body})
+
+    def add_thinking(self, ts: str, tag: str, label: str, text: str) -> None:
+        item = {"kind": "thinking", "ts": ts, "tag": tag, "label": label, "text": text}
+        self.add_item(item)
+
+    def add_text(self, ts: str, tag: str, text: str) -> None:
+        item = {"kind": "text", "ts": ts, "tag": tag, "text": text}
+        self.add_item(item)
+        self.turn["last_text"] = item
+
+    def add_call(self, ts: str, tag: str, name: str, inp: dict, output: str | None,
+                 failed: bool = False, denied: str | None = None) -> None:
+        item = {
+            "kind": "call",
+            "ts": ts,
+            "tag": tag,
+            "name": name,
+            "input": inp,
+            "output": output,
+            "failed": failed,
+            "denied": denied,
+        }
+        self.add_item(item)
+
+    def start_loop(self, ts: str = "", request: dict | None = None) -> None:
+        if self.loop is None or self.loop["items"]:
+            self.loop = {"requests": [], "items": [], "ts": ts}
+            self.turn["loops"].append(self.loop)
+        if request is not None:
+            self.loop["requests"].append(request)
+
+    def set_user(self, ts: str, tag: str, label: str, text: str) -> None:
+        self.turn["user"] = {"ts": ts, "tag": tag, "label": label, "text": text}
+
+    def reset(self) -> None:
+        self.turn = new_turn()
+        self.loop = None
+
+
+def final_text_for(turn: dict) -> dict | None:
+    """The last assistant text with no tool call or later loop after it."""
+    last = turn["last_text"]
+    if last is None:
+        return None
+
+    def call_after(items: list[dict]) -> bool:
+        seen = False
+        for item in items:
+            if item is last:
+                seen = True
+            elif seen and item["kind"] == "call":
+                return True
+        return False
+
+    if any(item is last for item in turn["pre"]):
+        return None if turn["loops"] or call_after(turn["pre"]) else last
+    for index, loop in enumerate(turn["loops"]):
+        if any(item is last for item in loop["items"]):
+            if call_after(loop["items"]):
+                return None
+            if any(later["requests"] or later["items"] for later in turn["loops"][index + 1:]):
+                return None
+            return last
+    return None
+
+
+def render_item(view, item, tmpdir, final) -> None:
     """Render one loop item; the final assistant text is left for render_turn."""
     if item is final:
         return
@@ -1491,69 +1602,84 @@ def render_item(view, item, results, tmpdir, final) -> None:
     if kind == "thinking":
         add_thinking(view, item)
     elif kind == "call":
-        add_call(view, item, results, tmpdir)
-    elif kind == "text":
-        view.section(
-            f"{item['ts']} {item['tag']}ASSISTANT: {text_preview(item['text'])}",
-            item["text"].splitlines(),
+        tool_section(
+            view, item["ts"], item["tag"], item["name"], item["input"], item["output"],
+            tmpdir, item["failed"], item["denied"],
         )
+    elif kind == "text":
+        message_section(view, item["ts"], item["tag"], "ASSISTANT", item["text"])
     else:  # note
         view.section(item["header"], item["body"])
 
 
-def render_loop(view, loop, results, tmpdir, blobs, shapes, by_id, final) -> None:
-    """One API-request/thinking/tool-call loop, folded as a block."""
+def render_loop(view, loop, tmpdir, final, draw_request=None) -> None:
+    """One model-response loop, folded as a block."""
     requests = loop["requests"]
     items = loop["items"]
     thinking = sum(1 for item in items if item["kind"] == "thinking")
     calls = sum(1 for item in items if item["kind"] == "call")
-    parts = ["API request" if len(requests) == 1 else f"{len(requests)} API requests"]
+    texts = sum(1 for item in items if item["kind"] == "text")
+    parts = []
+    if requests:
+        parts.append("API request" if len(requests) == 1 else f"{len(requests)} API requests")
     if thinking:
         parts.append(f"{thinking} thinking")
     if calls:
         parts.append(f"{calls} tool call{'s' if calls != 1 else ''}")
-    ts = record_ts(requests[0]) if requests else ""
+    if texts and not parts:
+        parts.append(f"{texts} assistant text{'s' if texts != 1 else ''}")
     start = len(view.lines) + 1
-    view.lines.append(f"{ts} LOOP: " + " · ".join(parts))
-    for rec in requests:
-        render_request(view, rec, blobs, shapes, by_id)
+    view.lines.append(f"{loop['ts']} LOOP: " + (" · ".join(parts) or "items"))
+    if draw_request is not None:
+        for rec in requests:
+            draw_request(view, rec)
     for item in items:
-        render_item(view, item, results, tmpdir, final)
+        render_item(view, item, tmpdir, final)
     if len(view.lines) > start:
         view.folds.append((start, len(view.lines)))
     view.lines.append("")
 
 
-def render_turn(view, turn, results, tmpdir, blobs, shapes, by_id, final) -> None:
+def render_turn(view, turn, tmpdir, draw_request=None) -> None:
     """USER, its repeated loops (one PROCEDURE fold), then the final ASSISTANT text."""
+    if (
+        turn["user"] is None
+        and not turn["pre"]
+        and not turn["loops"]
+        and turn["last_text"] is None
+    ):
+        return
+    final = final_text_for(turn)
+    # A final response that holds only that text has no procedure to show once
+    # the text is hoisted, so it does not count as a loop.
+    loops = [
+        loop
+        for loop in turn["loops"]
+        if loop["requests"] or any(item is not final for item in loop["items"])
+    ]
     user = turn["user"]
     if user is not None:
-        view.section(
-            f"{user['ts']} {user['tag']}{user['label']}: {text_preview(user['text'])}",
-            user["text"].splitlines(),
-        )
+        message_section(view, user["ts"], user["tag"], user["label"], user["text"])
     pre = turn["pre"]
-    loops = turn["loops"]
     if len(loops) > 1 or (loops and pre):
         start = len(view.lines) + 1
-        ts = record_ts(loops[0]["requests"][0]) if loops and loops[0]["requests"] else ""
         count = len(loops)
         view.lines.extend(
-            [f"{ts} PROCEDURE ({count} loop{'s' if count != 1 else ''})", ""]
+            [f"{loops[0]['ts']} PROCEDURE ({count} loop{'s' if count != 1 else ''})", ""]
         )
         for item in pre:
-            render_item(view, item, results, tmpdir, final)
+            render_item(view, item, tmpdir, final)
         for loop in loops:
-            render_loop(view, loop, results, tmpdir, blobs, shapes, by_id, final)
+            render_loop(view, loop, tmpdir, final, draw_request)
         view.folds.append((start, len(view.lines)))
         view.lines.append("")
     else:
         for item in pre:
-            render_item(view, item, results, tmpdir, final)
+            render_item(view, item, tmpdir, final)
         for loop in loops:
-            render_loop(view, loop, results, tmpdir, blobs, shapes, by_id, final)
+            render_loop(view, loop, tmpdir, final, draw_request)
     if final is not None:
-        render_item(view, final, results, tmpdir, None)
+        render_item(view, final, tmpdir, None)
 
 
 def claude_active_uuids(records: list[dict]) -> set[str] | None:
@@ -1625,7 +1751,7 @@ def claude_active_requests(records: list[dict], active: set[str] | None) -> set[
     return live
 
 
-def claude_view(s: Session, view: ViewBuilder, tmpdir: Path) -> None:
+def claude_view(s: Session, view: "ViewBuilder", tmpdir: Path) -> None:
     """Render a Claude session into view.
 
     Shows user/assistant text, thinking, grouped tool calls with their results,
@@ -1668,101 +1794,39 @@ def claude_view(s: Session, view: ViewBuilder, tmpdir: Path) -> None:
                 if block.get("type") == "tool_result":
                     results[block.get("tool_use_id")] = (block, rec)
 
-    title = " ".join((s.title or "").split()) or s.id
-    view.lines.extend(
-        [
-            title,
-            f"claude · {s.id} · {s.cwd}",
-            "fold: za/zo/zc or click the fold column · full output: gf on its path",
-            "",
-        ]
-    )
-    def new_turn() -> dict:
-        return {"user": None, "pre": [], "loops": [], "last_text": None}
+    view_header(view, s)
+    builder = TurnBuilder()
 
-    turn = new_turn()
-    loop: dict | None = None
-
-    def add_item(item: dict) -> None:
-        if loop is not None:
-            loop["items"].append(item)
-        else:
-            turn["pre"].append(item)
-
-    def add_note(header: str, body: list[str]) -> None:
-        add_item({"kind": "note", "header": header, "body": body})
-
-    def add_thinking_item(ts: str, tag: str, label: str, text: str) -> None:
-        add_item({"kind": "thinking", "ts": ts, "tag": tag, "label": label, "text": text})
+    def draw_request(v, rec: dict) -> None:
+        render_request(v, rec, blobs, shapes, requests_by_id)
 
     def add_call_item(block: dict, ts: str, tag: str) -> None:
-        add_item(call_entry(block, ts, tag))
-
-    def add_text_item(ts: str, tag: str, text: str) -> None:
-        item = {"kind": "text", "ts": ts, "tag": tag, "text": text}
-        add_item(item)
-        turn["last_text"] = item
-
-    def start_loop(rec: dict) -> None:
-        nonlocal loop
-        if loop is None or loop["items"]:
-            loop = {"requests": [], "items": []}
-            turn["loops"].append(loop)
-        loop["requests"].append(rec)
-
-    def final_text_for(turn: dict) -> dict | None:
-        """The last assistant text with no tool call or later loop after it."""
-        last = turn["last_text"]
-        if last is None:
-            return None
-
-        def call_after(items: list[dict]) -> bool:
-            seen = False
-            for item in items:
-                if item is last:
-                    seen = True
-                elif seen and item["kind"] == "call":
-                    return True
-            return False
-
-        if any(item is last for item in turn["pre"]):
-            return None if turn["loops"] or call_after(turn["pre"]) else last
-        for index, loop in enumerate(turn["loops"]):
-            if any(item is last for item in loop["items"]):
-                if call_after(loop["items"]):
-                    return None
-                if any(later["requests"] or later["items"] for later in turn["loops"][index + 1:]):
-                    return None
-                return last
-        return None
+        result, rec = results.get(block.get("id"), (None, None))
+        inp = block.get("input")
+        builder.add_call(
+            ts,
+            tag,
+            block.get("name") or "?",
+            inp if isinstance(inp, dict) else {"input": inp},
+            tool_text(rec, result) if result is not None else None,
+            bool(result and result.get("is_error")),
+            rec.get("toolDenialKind") if rec else None,
+        )
 
     def flush_turn() -> None:
-        nonlocal turn, loop
-        empty = (
-            turn["user"] is None
-            and not turn["pre"]
-            and not turn["loops"]
-            and turn["last_text"] is None
-        )
-        if not empty:
-            final = final_text_for(turn)
-            render_turn(view, turn, results, tmpdir, blobs, shapes, requests_by_id, final)
-        turn = new_turn()
-        loop = None
+        render_turn(view, builder.turn, tmpdir, draw_request)
+        builder.reset()
 
     for i, rec in enumerate(records):
         kind = rec.get("type")
         if kind == "api-request":
             if i in live_requests:
-                start_loop(rec)
+                builder.start_loop(record_ts(rec), rec)
             continue
         if rewound(rec):
             continue
         ts = record_ts(rec)
         tag = "[subagent] " if rec.get("isSidechain") else ""
-        if kind == "api-request":
-            start_loop(rec)
-            continue
         if kind == "user":
             if rec.get("isMeta"):
                 continue
@@ -1774,20 +1838,20 @@ def claude_view(s: Session, view: ViewBuilder, tmpdir: Path) -> None:
             )
             if text and not synthetic:
                 carried = None
-                if turn["loops"]:
-                    trailing = turn["loops"][-1]
+                if builder.turn["loops"]:
+                    trailing = builder.turn["loops"][-1]
                     last_ts = record_ts(trailing["requests"][-1]) if trailing["requests"] else ""
                     if not trailing["items"] and last_ts and last_ts == ts:
                         # The request for this user turn is logged just before it.
-                        carried = turn["loops"].pop()
+                        carried = builder.turn["loops"].pop()
                 flush_turn()
                 label = "CONTEXT SUMMARY" if rec.get("isCompactSummary") else "USER"
-                turn["user"] = {"ts": ts, "tag": tag, "label": label, "text": text}
+                builder.set_user(ts, tag, label, text)
                 if carried is not None:
                     for request in list(carried["requests"]):
-                        start_loop(request)
+                        builder.start_loop(record_ts(request), request)
             if rec.get("interruptedMessageId"):
-                add_note(f"{ts} {tag}user interrupted", [])
+                builder.add_note(f"{ts} {tag}user interrupted", [])
             continue
         if kind == "assistant":
             msg = rec.get("message")
@@ -1795,35 +1859,35 @@ def claude_view(s: Session, view: ViewBuilder, tmpdir: Path) -> None:
             blocks = content_blocks(rec)
             if rec.get("isApiErrorMessage"):
                 text = ClaudeAgent.user_text(msg) or json.dumps(msg, ensure_ascii=False)
-                add_note(f"{ts} {tag}API error", text.splitlines())
+                builder.add_note(f"{ts} {tag}API error", text.splitlines())
                 continue
             for block in blocks:
                 typ = block.get("type")
                 if typ == "text":
                     text = (block.get("text") or "").strip()
                     if text:
-                        add_text_item(ts, tag, text)
+                        builder.add_text(ts, tag, text)
                 elif typ == "thinking":
                     text = (block.get("thinking") or "").strip()
                     label = "thinking"
                     if rec.get("thinkingDisplay") == "summarized":
                         label += " (summarized)"
-                    add_thinking_item(ts, tag, label, text)
+                    builder.add_thinking(ts, tag, label, text)
                 elif typ == "tool_use":
                     add_call_item(block, ts, tag)
                 elif typ == "image":
-                    add_note(f"{ts} {tag}image", ["[image]"])
+                    builder.add_note(f"{ts} {tag}image", ["[image]"])
                 else:
-                    add_note(
+                    builder.add_note(
                         f"{ts} {tag}{typ or 'block'}",
                         [json.dumps(block, ensure_ascii=False)],
                     )
             if not blocks:
                 text = ClaudeAgent.user_text(msg).strip()
                 if text:
-                    add_text_item(ts, tag, text)
+                    builder.add_text(ts, tag, text)
             if rec.get("error") or rec.get("apiErrorStatus"):
-                add_note(
+                builder.add_note(
                     f"{ts} {tag}API error",
                     [str(rec.get("error") or rec.get("apiErrorStatus"))],
                 )
@@ -1838,7 +1902,7 @@ def claude_view(s: Session, view: ViewBuilder, tmpdir: Path) -> None:
                 meta = rec.get("compactMetadata")
                 if isinstance(meta, dict) and meta:
                     body.append(json.dumps(meta, ensure_ascii=False))
-                add_note(f"{ts} {tag}context compacted", body or ["Conversation compacted"])
+                builder.add_note(f"{ts} {tag}context compacted", body or ["Conversation compacted"])
             elif content:
                 level = rec.get("level") or "info"
                 labels = {
@@ -1852,7 +1916,7 @@ def claude_view(s: Session, view: ViewBuilder, tmpdir: Path) -> None:
                     match = re.search(r"<command-name>([^<]+)</command-name>", str(content))
                     if match:
                         label = f"command {match.group(1)}"
-                add_note(f"{ts} {tag}{label}", str(content).splitlines())
+                builder.add_note(f"{ts} {tag}{label}", str(content).splitlines())
             continue
         if kind == "attachment":
             attachment = rec.get("attachment")
@@ -1863,12 +1927,194 @@ def claude_view(s: Session, view: ViewBuilder, tmpdir: Path) -> None:
                 continue
             text = attachment_text(rec)
             if text:
-                add_note(
+                builder.add_note(
                     f"{ts} {tag}attachment: {attachment.get('type')}",
                     text.splitlines(),
                 )
             continue
     flush_turn()
+
+
+def parse_arguments(raw) -> dict:
+    """A Codex function_call's JSON arguments as a dict; anything else is kept as `arguments`."""
+    if isinstance(raw, dict):
+        return raw
+    try:
+        value = json.loads(raw or "{}")
+    except (json.JSONDecodeError, TypeError):
+        return {"arguments": raw}
+    return value if isinstance(value, dict) else {"arguments": value}
+
+
+def codex_reasoning(payload: dict) -> str:
+    """Readable reasoning: summary parts, or raw reasoning content when Codex logs it."""
+    parts = []
+    for key in ("summary", "content"):
+        for block in payload.get(key) or []:
+            if isinstance(block, dict) and isinstance(block.get("text"), str):
+                if block["text"].strip():
+                    parts.append(block["text"].strip())
+    return "\n\n".join(parts)
+
+
+def codex_view(s: Session, view: "ViewBuilder", tmpdir: Path) -> None:
+    """Render a Codex rollout: prompts, reasoning summaries, tool calls and replies.
+
+    A model response is one loop: its reasoning, message and calls until the
+    following tool outputs. Codex logs each prompt and assistant message twice,
+    as a model-visible response_item and an event_msg copy; one kind is used,
+    never both."""
+    records = list(read_jsonl(s.path))
+    modern = any(CodexAgent.modern_prompt(rec) for rec in records)
+    outputs: dict[str, str] = {}
+    for rec in records:
+        payload = rec.get("payload") or {}
+        if rec.get("type") != "response_item":
+            continue
+        if payload.get("type") in ("function_call_output", "custom_tool_call_output"):
+            output = payload.get("output")
+            if isinstance(payload.get("call_id"), str):
+                outputs[payload["call_id"]] = (
+                    output if isinstance(output, str) else json.dumps(output, ensure_ascii=False)
+                )
+
+    view_header(view, s)
+    builder = TurnBuilder()
+    response_open = False
+
+    def begin_response(ts: str) -> None:
+        nonlocal response_open
+        if not response_open:
+            builder.start_loop(ts)
+            response_open = True
+
+    def finish_turn() -> None:
+        nonlocal response_open
+        render_turn(view, builder.turn, tmpdir)
+        builder.reset()
+        response_open = False
+
+    def new_user(ts: str, text: str) -> None:
+        finish_turn()
+        builder.set_user(ts, "", "USER", text)
+
+    for rec in records:
+        payload = rec.get("payload") or {}
+        kind = payload.get("type")
+        ts = record_ts(rec)
+        if rec.get("type") == "response_item":
+            if kind in ("function_call_output", "custom_tool_call_output"):
+                response_open = False  # the response is done; the next item starts a new loop
+            elif kind == "message":
+                role = payload.get("role")
+                if role == "user":
+                    text = CodexAgent.modern_prompt(rec)
+                    # <turn_aborted> is injected context; event_msg reports the interrupt.
+                    if text and not text.startswith("<turn_aborted>"):
+                        new_user(ts, text)
+                elif role == "assistant":
+                    text = "\n".join(
+                        block.get("text", "")
+                        for block in payload.get("content") or []
+                        if isinstance(block, dict) and block.get("type") == "output_text"
+                    ).strip()
+                    if text:
+                        begin_response(ts)
+                        builder.add_text(ts, "", text)
+            elif kind == "reasoning":
+                text = codex_reasoning(payload)
+                if text:
+                    begin_response(ts)
+                    builder.add_thinking(ts, "", "THINKING", text)
+            elif kind == "function_call":
+                begin_response(ts)
+                builder.add_call(
+                    ts,
+                    "",
+                    payload.get("name") or "?",
+                    parse_arguments(payload.get("arguments")),
+                    outputs.get(payload.get("call_id")),
+                )
+            elif kind == "custom_tool_call":
+                begin_response(ts)
+                builder.add_call(
+                    ts, "", payload.get("name") or "?",
+                    {"input": payload.get("input")}, outputs.get(payload.get("call_id")),
+                )
+            elif kind == "web_search_call":
+                begin_response(ts)
+                action = payload.get("action")
+                builder.add_call(
+                    ts, "", "web_search", action if isinstance(action, dict) else {}, None
+                )
+        elif rec.get("type") == "event_msg":
+            if kind == "user_message" and not modern:
+                text = CodexAgent.old_prompt(rec)
+                if text:
+                    new_user(ts, text)
+            elif kind == "turn_aborted":
+                reason = payload.get("reason") or "interrupted"
+                builder.add_note(f"{ts} user interrupted ({reason})", [])
+            elif kind in ("error", "stream_error"):
+                text = payload.get("message")
+                if text:
+                    builder.add_note(f"{ts} {kind.replace('_', ' ')}", str(text).splitlines())
+    finish_turn()
+
+
+def opencode_view(agent: "OpenCodeAgent", s: Session, view: "ViewBuilder", tmpdir: Path) -> None:
+    """Render an OpenCode session: message text, reasoning and tool calls.
+
+    One assistant message is one response loop. A tool part carries its own
+    input and result, so no separate pairing pass is needed."""
+    view_header(view, s)
+    builder = TurnBuilder()
+    for typ, data in agent.messages(s):
+        ts = OpenCodeAgent.timestamp(data.get("time") or {})
+        if typ == "user":
+            text = (data.get("text") or "").strip()
+            if text:
+                render_turn(view, builder.turn, tmpdir)
+                builder.reset()
+                builder.set_user(ts, "", "USER", text)
+        elif typ == "assistant":
+            parts = [part for part in data.get("content") or [] if isinstance(part, dict)]
+            if not parts:
+                continue
+            builder.start_loop(ts)
+            for part in parts:
+                part_ts = OpenCodeAgent.timestamp(part.get("time") or {}) or ts
+                kind = part.get("type")
+                if kind == "reasoning":
+                    text = (part.get("text") or "").strip()
+                    if text:
+                        builder.add_thinking(part_ts, "", "THINKING", text)
+                elif kind == "text":
+                    text = (part.get("text") or "").strip()
+                    if text:
+                        builder.add_text(part_ts, "", text)
+                elif kind == "tool":
+                    state = part.get("state") or {}
+                    inp = state.get("input") if isinstance(state.get("input"), dict) else {}
+                    failed = state.get("status") == "error"
+                    if failed:
+                        error = state.get("error")
+                        output = error.get("message") if isinstance(error, dict) else None
+                    else:
+                        output = text_of(state.get("content"))
+                    builder.add_call(part_ts, "", part.get("name") or "?", inp, output, failed)
+        elif typ == "compaction":
+            summary = (data.get("summary") or "").strip()
+            builder.add_note(
+                f"{ts} context compacted ({data.get('reason') or 'auto'})",
+                summary.splitlines() or ["(no summary)"],
+            )
+        elif typ == "system":
+            text = (data.get("text") or "").strip()
+            if text:
+                builder.add_note(f"{ts} SYSTEM: {text_preview(text)}", text.splitlines())
+        # idle and synthetic records carry no conversation text
+    render_turn(view, builder.turn, tmpdir)
 
 
 def vim_viewer_script(folds: list[tuple[int, int]]) -> str:
@@ -1902,7 +2148,7 @@ def vim_viewer_script(folds: list[tuple[int, int]]) -> str:
 
 
 def view_session(s: Session) -> None:
-    """Render a Claude session and open it in vim with every section folded."""
+    """Render a session and open it in vim with every section folded."""
     vim = shutil.which("vim") or shutil.which("nvim")
     if vim is None:
         print("vim not found; cannot open the viewer", file=sys.stderr)
@@ -1911,7 +2157,7 @@ def view_session(s: Session) -> None:
     try:
         view = ViewBuilder()
         try:
-            claude_view(s, view, tmpdir)
+            agent_of(s).view(s, view, tmpdir)
         except OSError as e:  # the transcript vanished or the spill file cannot be written
             print(f"Cannot read {s.path}: {e}", file=sys.stderr)
             return
