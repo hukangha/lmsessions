@@ -214,8 +214,9 @@ Keys: `j/k`/up/down arrows move, `Ctrl+f/b` page, `g/G` first/last,
 run starts or reverses direction (so holding it toggles a run and reversing
 un-toggles it back; at a list end a held key does nothing), `Space` toggle the
 current row, `y` copy id, `/` incremental search, `d` dump, `v` open the session
-viewer, `Delete` remove, `Enter` resume, `q` quit, `Esc` quit (or
-back when `hits` set). Clicking a
+viewer, `Delete` remove, `Enter` resume — or, with several rows marked, open a
+submenu of just those rows — `q` quit, `Esc` quit (or back when `hits` is set
+or `can_back` says the page was opened from another). Clicking a
 header sorts (same header toggles direction); marks and cursor follow sessions
 by identity.
 Clicking a row copies the CWD (or, outside that column, the transcript's
@@ -234,22 +235,28 @@ drifts there. Holding each notch costs every notch one gap of latency.
 Returns `(action, payload, current, sort)` where `sort` is the
 `(attribute, reverse)` the list ended up in:
 `remove`/`dump` → the picker's `marks` (possibly empty; the caller falls back
-to `current`); `resume`/`view` → the `Session`; `search` → pattern; `back` →
-`None`; `None` → cancelled. Passing `sort` back in re-sorts `rows` to it, so the
-order survives every return to the picker.
+to `current`); `submenu` → the marked `Session`s; `resume`/`view` → the
+`Session`; `search` → pattern; `back` → `None`; `None` → cancelled. Passing
+`sort` back in re-sorts `rows` to it, so the order survives every return to the
+picker.
 
 ## Menu loop (`interactive_menu`)
 
 Wraps the picker and keeps a `history` stack of
-`(rows, hits, cw, filters, marks)` — one entry per successful search, so `Esc`
-on a search page reopens the page searched from. Additional searches compose:
+`(rows, hits, cw, filters, marks, base)` — one entry per successful search or
+Enter-opened submenu, so `Esc` on such a page reopens the page it came from.
+`base` is a submenu's session list; `None` means every session for the cwd.
+Additional searches compose:
 `filters` is cumulative (rows must match all regexes, case-insensitive), and
 `hits` shown always come from the latest filter. The picker's `sort` is kept
 here and handed back to every picker invocation, so the order survives search,
 back, dump and removal.
 
-After a removal it discards history (it may point at gone sessions) and
-rebuilds `rows` with `rebuild_rows()`, reapplying all filters. That helper keeps
+After a removal it keeps the history stack, pruning the removed sessions from
+every page (and dropping a page left empty), so `Esc` still walks back through
+it. It then rebuilds `rows` with `rebuild_rows()`, reapplying all filters, and
+falls back to the page above if the current page emptied; a submenu keeps its
+scope, with the removed sessions dropped from `base`. That helper keeps
 the sessions in the order they were last shown (unseen ones last) rather than
 `all_sessions()`'s oldest-first order, so ties of the sort column do not
 reshuffle after a delete. The highlight keeps its row index into the rebuilt

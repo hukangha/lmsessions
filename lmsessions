@@ -938,17 +938,20 @@ def pick_sessions(
     hits: dict[tuple[str, str], list[Hit]] | None = None,
     focus: Session | None = None,
     sort: tuple[str, bool] | None = None,
-) -> tuple[str, list[int] | Session | str | None, Session, tuple[str, bool]] | None:
+    can_back: bool = False,
+) -> tuple[str, list[int] | list[Session] | Session | str | None, Session, tuple[str, bool]] | None:
     """Inline picker drawn below the cursor.
 
     hits maps (agent, id) to matched snippets; when given, snippets are shown
     under each session (all of them for the current or a marked row). focus is
     the session to highlight on start. sort is the (attribute, reverse) the list
-    was last shown in; rows are re-sorted to it when given. Returns
-    (action, payload, current, sort) where action is 'remove'|'dump' (the marked
-    row indexes, possibly empty) on Delete/d, 'resume' (session) on Enter,
-    'view' (session) on v, 'search' (pattern) on / + Enter, 'back' (None) on Esc
-    from a search page, or None on q/Esc at the top level."""
+    was last shown in; rows are re-sorted to it when given. can_back makes Esc
+    back out even without snippets. Returns (action, payload, current, sort)
+    where action is 'remove'|'dump' (the marked row indexes, possibly empty) on
+    Delete/d, 'submenu' (the marked sessions) on Enter when several are marked,
+    'resume' (session) on Enter, 'view' (session) on v, 'search' (pattern) on
+    / + Enter, 'back' (None) on Esc from a search page (or when can_back), or
+    None on q/Esc at the top level."""
     sort_attr, reverse = sort or ("mtime", False)  # the list starts out oldest first
     if sort is not None:  # rows may not carry the order the caller was shown
         rows.sort(key=sort_key(sort_attr), reverse=reverse)
@@ -966,10 +969,10 @@ def pick_sessions(
         cur = next(
             (i for i, r in enumerate(rows) if (r.agent, r.id) == (focus.agent, focus.id)), cur
         )
-    quit_hint = "quit:q back:Esc" if hits is not None else "quit:q/Esc"
+    quit_hint = "quit:q back:Esc" if hits is not None or can_back else "quit:q/Esc"
     footer = (
         "move:j/k,↓/↑ search:/ page:Ctrl+f/b top/bottom:g/G title:h/l,←→/Tab sort:s toggle:Shift+j/k,Space"
-        f" copy-id:y dump:d view:v delete:del goto:Enter {quit_hint}"
+        f" copy-id:y dump:d view:v delete:del goto/open:Enter {quit_hint}"
     )
     status = ""  # footer message, e.g. after yanking an id
     shift_dir: int | None = None  # direction of the current Shift+j/k run
@@ -1250,8 +1253,12 @@ def pick_sessions(
             elif key == "delete":
                 return "remove", marks, rows[cur], (sort_attr, reverse)
             elif key in ("\r", "\n"):
+                if len(marks) > 1:  # a selection narrows the menu to just those rows
+                    return (
+                        "submenu", [rows[i] for i in sorted(marks)], rows[cur], (sort_attr, reverse)
+                    )
                 return "resume", rows[cur], rows[cur], (sort_attr, reverse)
-            elif key == "esc" and hits is not None:
+            elif key == "esc" and (hits is not None or can_back):
                 return "back", None, rows[cur], (sort_attr, reverse)
             elif key in ("q", "esc"):
                 return None
@@ -2375,32 +2382,70 @@ def interactive_menu(cwd: Path | None) -> int:
     hits: dict[tuple[str, str], list[Hit]] | None = None
     filters: list[re.Pattern] = []
     history: list[tuple[
-        list[Session], dict[tuple[str, str], list[Hit]] | None, int, list[re.Pattern], list[int]
+        list[Session], dict[tuple[str, str], list[Hit]] | None, int, list[re.Pattern], list[int],
+        list[Session] | None,
     ]] = []
     focus: Session | None = None
     sort: tuple[str, bool] | None = None  # kept across pages: backing out restores the order
+    base: list[Session] | None = None  # a submenu's sessions; None = every session for cwd
 
     def rebuild_rows() -> list[Session]:
-        """Every session, in the order rows are shown now; unseen ones last.
+        """The page's sessions, in the order rows are shown now; unseen ones last.
 
         A fresh all_sessions() is oldest-first, so re-sorting it by key can put
         ties in a different order than the list the user was looking at."""
         seen = {(s.agent, s.id): i for i, s in enumerate(rows)}
-        return sorted(all_sessions(cwd), key=lambda s: seen.get((s.agent, s.id), len(seen)))
+        pool = all_sessions(cwd) if base is None else base
+        return sorted(pool, key=lambda s: seen.get((s.agent, s.id), len(seen)))
+
+    def prune_pages(gone: set[tuple[str, str]]) -> None:
+        """Drop the removed sessions from the history pages; drop pages left empty.
+
+        The stack survives a removal, so Esc still walks back through every
+        search and submenu page that led here. Marks keep their sessions."""
+        kept = []
+        for hrows, page_hits, _, page_filters, page_marks, page_base in history:
+            marked = {(hrows[i].agent, hrows[i].id) for i in page_marks}
+            hrows = [s for s in hrows if (s.agent, s.id) not in gone]
+            if not hrows:  # nothing left to show on that page
+                continue
+            kept.append((
+                hrows,
+                None if page_hits is None else {
+                    k: v for k, v in page_hits.items() if k not in gone
+                },
+                cwd_width(hrows, cwd),
+                page_filters,
+                [i for i, s in enumerate(hrows) if (s.agent, s.id) in marked],
+                None if page_base is None else [
+                    s for s in page_base if (s.agent, s.id) not in gone
+                ],
+            ))
+        history[:] = kept
 
     while True:
-        result = pick_sessions(rows, cw, marks, hits, focus, sort)
+        result = pick_sessions(rows, cw, marks, hits, focus, sort, can_back=base is not None)
         if result is None:
             print("Cancelled.")
             return 0
         kind, payload, focus, sort = result
-        if kind == "back":  # Esc on a search page: back to the page searched from
+        if kind == "back":  # Esc on a search or submenu page: back to the page opened from
             if history:
-                rows, hits, cw, filters, marks = history.pop()
-            else:  # no page left (e.g. after a removal): drop all filters
+                rows, hits, cw, filters, marks, base = history.pop()
+            else:  # no page left: back to the whole list, with filters and submenu scope dropped
+                base = None
                 rows = rebuild_rows()
                 hits, filters, marks = None, [], []
                 cw = cwd_width(rows, cwd)
+                if not rows:
+                    print(f"No sessions left for {where(cwd)}")
+                    return 0
+            continue
+        if kind == "submenu":  # Enter with several marked: a menu of just those rows
+            history.append((rows, hits, cw, list(filters), list(marks), base))
+            base = list(payload)
+            rows, hits, filters, marks = list(base), None, [], []
+            cw = cwd_width(rows, cwd)
             continue
         if kind == "search":
             try:
@@ -2412,7 +2457,7 @@ def interactive_menu(cwd: Path | None) -> int:
             if not found:
                 print(f"No sessions match: {payload}")
                 continue
-            history.append((rows, hits, cw, list(filters), list(marks)))
+            history.append((rows, hits, cw, list(filters), list(marks), base))
             filters = filters + [rx]
             rows = [s for s, _ in found]
             hits = {(s.agent, s.id): h for s, h in found}
@@ -2440,13 +2485,19 @@ def interactive_menu(cwd: Path | None) -> int:
             marks = payload  # Esc at the confirmation: back to the picker, selection kept
             continue
         # Removed: pick again from what is left instead of exiting.
-        history = []  # its pages may point at removed sessions
+        gone = {(s.agent, s.id) for s in targets}
+        if base is not None:  # a submenu keeps its scope: drop what was just removed
+            base = [s for s in base if (s.agent, s.id) not in gone]
+        prune_pages(gone)  # Esc still walks back up through the stack
         here = next((i for i, s in enumerate(rows) if s is focus), 0)  # keep the highlight's row
         rows = [s for s in rebuild_rows() if all(find_hits(s, rx) for rx in filters)]
         hits = (
             {(s.agent, s.id): find_hits(s, filters[-1]) for s in rows} if filters else None
         )
         if not rows:
+            if history:  # this page emptied: the page it came from still has sessions
+                rows, hits, cw, filters, marks, base = history.pop()
+                continue
             print("No matching sessions left." if filters else f"No sessions left for {where(cwd)}")
             return 0
         cw = cwd_width(rows, cwd)
