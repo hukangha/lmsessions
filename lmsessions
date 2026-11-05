@@ -1631,11 +1631,6 @@ def attachment_text(rec: dict) -> str:
     return "\n".join(parts).strip()
 
 
-def head_tail(lines: list[str], n: int) -> list[str]:
-    """The first and last n lines, with the elided middle replaced by six dots."""
-    return lines if len(lines) <= 2 * n else lines[:n] + ["......"] + lines[-n:]
-
-
 def block_kind(block) -> str:
     """The selectable kind of a request content block."""
     kind = block.get("type") if isinstance(block, dict) else None
@@ -1895,9 +1890,6 @@ def render_request(view, rec, records, blobs, shapes, by_id, rebuilt, options) -
     system_text = "\n".join(
         block.get("text", "") for block in body.system if isinstance(block, dict)
     )
-    if system_text.strip():
-        lines.append("system:")
-        lines.extend(head_tail(system_text.splitlines(), 5))
     if body.tools:
         names = [tool.get("name") or "?" for tool in body.tools if isinstance(tool, dict)]
         lines.append("tools: " + ", ".join(names))
