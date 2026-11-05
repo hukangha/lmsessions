@@ -1677,7 +1677,8 @@ def message_lines(index: int, message: dict, marker: str = "", parts=None) -> li
         body.extend(str(content or "").splitlines() or [""])
     if parts is not None and content not in (None, "", []) and not body:
         return []  # every part of this message was deselected
-    return [f"[{index}]{marker} {role}"] + body
+    label = "" if index is None else f"[{index}]"  # None: the request's system prompt
+    return [f"{label}{marker} {role}".strip()] + body
 
 
 def claude_message_hash(message: dict) -> str:
@@ -1880,7 +1881,7 @@ def claude_request_body(
 
 
 def render_request(view, rec, records, blobs, shapes, by_id, rebuilt, options) -> None:
-    """One folded section for an API request: params, shape and selected messages."""
+    """One folded section for an API request: params, shape and the body's last messages."""
     body = claude_request_body(records, rec, blobs, shapes, by_id, rebuilt)
     params = body.params
     base = rec.get("base")
@@ -1906,23 +1907,22 @@ def render_request(view, rec, records, blobs, shapes, by_id, rebuilt, options) -
         (i, message) for i, message in enumerate(body.messages)
         if message.get("role") in options.normal_parts or message.get("role") == "missing"
     ]
+    # The system prompt is what the model reads first, so it heads the body and
+    # counts as one of the entries the limit picks from the end.
+    entries: list[tuple[int | None, dict]] = []
+    if system_text.strip() and "system" in options.normal_parts:
+        entries.append((None, {"role": "system", "content": body.system}))
+    entries.extend(selected)
     limit = options.max_messages
-    if limit == 0 or not selected:
+    if limit == 0 or not entries:
         lines.append("content: (none)")
-    elif limit < 0 or len(selected) <= limit:
-        lines.append(f"content ({len(selected)} messages):")
-        for index, message in selected:
-            lines.extend(message_lines(index, message))
     else:
-        first = (limit + 1) // 2
-        last = limit - first
-        lines.append(f"content ({len(selected)} messages):")
-        for index, message in selected[:first]:
+        shown = entries if limit < 0 else entries[-limit:]
+        lines.append(f"content ({len(entries)} messages):")
+        if len(shown) < len(entries):
+            lines.append("......")
+        for index, message in shown:
             lines.extend(message_lines(index, message))
-        lines.append("......")
-        if last:
-            for index, message in selected[-last:]:
-                lines.extend(message_lines(index, message))
     base_label = f" base={(base or '')[:8]}" if base else ""
     view.section(
         f"{record_ts(rec)} API request model={params.get('model', '?')}"

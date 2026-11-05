@@ -131,8 +131,9 @@ list is every foldable section kind (`user`, `assistant`, `system`, `thinking`,
 `tool`, `note`, `attachment`, `api`, `loop`, `procedure`); the roles also filter
 API request messages, and deselecting a section hides it (`loop`/`procedure` hide
 only their grouping fold). Normal mode also
-shows up to `max_messages` actual request messages per API request, each in full
-content (default 6 = 3 head + 3 tail, `0` = none, `-1` = every selected message). Raw mode
+shows the last `max_messages` entries of each API request body in full content,
+eliding the front with `......`; the system prompt heads the list and counts as
+one entry, so a small limit omits it (`0` = none, `-1` = the whole body). Raw mode
 (`raw`) shows only reconstructed request bodies, filtered by `raw_parts` (roles
 and block kinds): the latest request, or with `accumulative` every request's
 growing prefix, marking messages added since the previous request with `+`.
