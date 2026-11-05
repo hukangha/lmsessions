@@ -88,7 +88,7 @@ RAW_LABELS = (
 @dataclass
 class ViewOptions:
     """Settings for the viewer, edited before vim opens."""
-    max_messages: int = 6  # -1 = all API request messages with full content, 0 = none
+    max_messages: int = 6  # -1 = every API request message, 0 = none
     normal_parts: tuple[str, ...] = NORMAL_PARTS
     raw_parts: tuple[str, ...] = RAW_PARTS
     raw: bool = False
@@ -1636,38 +1636,6 @@ def head_tail(lines: list[str], n: int) -> list[str]:
     return lines if len(lines) <= 2 * n else lines[:n] + ["......"] + lines[-n:]
 
 
-def message_summary(message: dict) -> str:
-    """One line naming a request message and enough text to place it."""
-    if not isinstance(message, dict):
-        return "?: (not an object)"
-    role = message.get("role") or "?"
-    content = message.get("content")
-    if isinstance(content, str):
-        text = content
-    elif isinstance(content, list):
-        parts = []
-        for block in content:
-            if not isinstance(block, dict):
-                continue
-            kind = block.get("type")
-            if kind == "text":
-                parts.append(block.get("text", ""))
-            elif kind == "tool_use":
-                parts.append(f"[tool_use {block.get('name') or '?'}]")
-            elif kind == "tool_result":
-                snippet = " ".join(text_of(block.get("content")).split())[:80]
-                parts.append(f"[tool_result {snippet}]" if snippet else "[tool_result]")
-            elif kind == "thinking":
-                parts.append("[thinking]")
-            else:
-                parts.append(f"[{kind or 'block'}]")
-        text = " ".join(parts)
-    else:
-        text = str(content or "")
-    text = " ".join(text.split()) or "(empty)"
-    return f"{role}: {text[:160]}{'…' if len(text) > 160 else ''}"
-
-
 def block_kind(block) -> str:
     """The selectable kind of a request content block."""
     kind = block.get("type") if isinstance(block, dict) else None
@@ -1941,23 +1909,20 @@ def render_request(view, rec, records, blobs, shapes, by_id, rebuilt, options) -
     limit = options.max_messages
     if limit == 0 or not selected:
         lines.append("content: (none)")
-    elif limit < 0:
-        lines.append(f"content ({len(selected)} messages, full):")
+    elif limit < 0 or len(selected) <= limit:
+        lines.append(f"content ({len(selected)} messages):")
         for index, message in selected:
             lines.extend(message_lines(index, message))
     else:
+        first = (limit + 1) // 2
+        last = limit - first
         lines.append(f"content ({len(selected)} messages):")
-        if len(selected) <= limit:
-            lines.extend(message_summary(message) for _, message in selected)
-        else:
-            first = (limit + 1) // 2
-            last = limit - first
-            head = selected[:first]
-            tail = selected[-last:] if last else []
-            lines.extend(message_summary(message) for _, message in head)
-            if len(head) + len(tail) < len(selected):
-                lines.append("......")
-            lines.extend(message_summary(message) for _, message in tail)
+        for index, message in selected[:first]:
+            lines.extend(message_lines(index, message))
+        lines.append("......")
+        if last:
+            for index, message in selected[-last:]:
+                lines.extend(message_lines(index, message))
     base_label = f" base={(base or '')[:8]}" if base else ""
     view.section(
         f"{record_ts(rec)} API request model={params.get('model', '?')}"
