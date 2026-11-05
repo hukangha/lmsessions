@@ -31,7 +31,7 @@ turns on the CWD column.
 ## Agents (`Agent` subclasses, one instance each in `AGENTS`)
 
 Each implements `sessions(cwd)`, `remove(s)`, `resume(s)`, `transcript(s)` and
-`view(s, view, tmpdir)` (the vim viewer). `agent_of(s)` looks one up by
+`view(s, view, tmpdir, options)` (the vim viewer). `agent_of(s)` looks one up by
 `s.agent` name. `removable` / `viewable` are class flags (default True); agy
 turns `viewable` off, and the picker/menu show a "not supported yet" message
 instead of calling that method.
@@ -109,7 +109,9 @@ click spans are unaffected.
 ## Session viewer (`v`)
 
 `v` returns `("view", session, ...)` for every viewable agent (not agy, which
-shows a message in the picker). `view_session()` calls
+shows a message in the picker). The menu loop then opens `edit_view_options()`;
+Enter there passes the saved options to `view_session()` and opens vim, Esc
+returns to the picker. `view_session()` calls
 `agent_of(s).view()`, which fills a `ViewBuilder` (lines plus fold ranges); it
 writes that into a temp file and runs `vim` on it; the picker has already
 restored the terminal by then, and the caller re-enters it with the same sort,
@@ -121,6 +123,20 @@ toggles a fold.
 
 `message_section()` and `tool_section()` build the shared USER/ASSISTANT/
 THINKING and tool-call folds; `view_header()` writes the title block.
+
+`ViewOptions` (`max_messages`, `normal_parts`, `raw_parts`, `raw`,
+`accumulative`) is kept by the menu loop. `v` opens `edit_view_options()` first;
+Enter there renders with the options, Esc returns to the picker. The normal-mode
+list is every foldable section kind (`user`, `assistant`, `system`, `thinking`,
+`tool`, `note`, `attachment`, `api`, `loop`, `procedure`); the roles also filter
+API request messages, and deselecting a section hides it (`loop`/`procedure` hide
+only their grouping fold). Normal mode also
+shows up to `max_messages` message summaries per API request (default 6 = 3 head
++ 3 tail, `0` = none, `-1` = every selected message with full content). Raw mode
+(`raw`) shows only reconstructed request bodies, filtered by `raw_parts` (roles
+and block kinds): the latest request, or with `accumulative` every request's
+growing prefix, marking messages added since the previous request with `+`.
+Non-Claude views accept `options` and ignore it.
 
 All three views feed `TurnBuilder`, so they share one turn shape:
 `render_turn()` writes USER, wraps repeated loops (and any items before the
@@ -160,9 +176,9 @@ sentences or 100 characters). Results pair with calls by `tool_use_id`;
 temp file, whose path is the last line (`gf` opens it). System notes cover
 compaction, slash commands, warnings, API errors, user interrupts and
 permission denials; sidechain records are prefixed `[subagent]`. Each
-`api-request` shows params, a shape summary and the head/tail of its content
-(the `base` chain supplies the first messages), with `......` eliding the
-middle. `isMeta` user records, synthetic `<local-command…>`/`<command-name…>`
+`api-request` shows params, a shape summary and up to `max_messages` messages of
+the reconstructed body whose role is selected (head/tail summaries with `......`;
+`-1` prints every such message in full). `isMeta` user records, synthetic `<local-command…>`/`<command-name…>`
 user text, `turn_duration`, most attachment types (`VIEW_ATTACHMENTS` is the
 whitelist) and the duplicated `api-request-blob`/`api-request-shape` records are
 skipped.
@@ -175,9 +191,8 @@ becomes a `text` block) and verify it with `claude_message_hash()` (SHA-256 of
 compact, sorted-key JSON). It reattaches `cacheControl` paths to the blocks they
 mark, parses the stringified tool `input_schema`, and returns a `RequestBody`
 (`payload()` strips `betas`, which is a request option, not a body field).
-Unrecoverable hashes become placeholders and are listed in `missing`. The viewer
-does not use it yet; `render_request()` still renders its compact head/tail
-summary.
+Unrecoverable hashes become placeholders and are listed in `missing`.
+`render_request()` and `render_raw_view()` use it.
 
 A rewind leaves the abandoned branch in the jsonl. `claude_active_uuids()` keeps
 only records on the live branch: start from the newest conversation record (or
@@ -220,8 +235,9 @@ Keys: `j/k`/up/down arrows move, `Ctrl+f/b` page, `g/G` first/last,
 `J/K`/Shift-arrows toggle the row stepped onto, plus the row being left when the
 run starts or reverses direction (so holding it toggles a run and reversing
 un-toggles it back; at a list end a held key does nothing), `Space` toggle the
-current row, `y` copy id, `/` incremental search, `v` open the session
-viewer, `Delete` remove, `Enter` resume — or, with several rows marked, open a
+current row, `y` copy id, `/` incremental search, `v` open the view options,
+then Enter opens the viewer, `Delete` remove, `Enter` resume — or, with several
+rows marked, open a
 submenu of just those rows — `q` quit, `Esc` quit (or back when `hits` is set
 or `can_back` says the page was opened from another). Clicking a
 header sorts (same header toggles direction); marks and cursor follow sessions
@@ -257,7 +273,8 @@ Additional searches compose:
 `filters` is cumulative (rows must match all regexes, case-insensitive), and
 `hits` shown always come from the latest filter. The picker's `sort` is kept
 here and handed back to every picker invocation, so the order survives search,
-back and removal.
+back and removal. The `view_options` edited before `v` lives here too and is
+passed to every `view_session()`.
 
 After a removal it keeps the history stack, pruning the removed sessions from
 every page (and dropping a page left empty), so `Esc` still walks back through

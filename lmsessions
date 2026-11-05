@@ -54,6 +54,47 @@ Turn = tuple[str, str, str]  # (role, timestamp, body)
 Hit = tuple[str, int, int]  # (snippet text, match start, match end within the snippet)
 
 
+NORMAL_PARTS = (
+    "user", "assistant", "system", "thinking", "tool", "note", "attachment",
+    "api", "loop", "procedure",
+)
+RAW_PARTS = (
+    "user", "assistant", "system", "text", "thinking", "tool_use", "tool_result", "other",
+)
+NORMAL_LABELS = (
+    ("user", "user"),
+    ("assistant", "assistant"),
+    ("system", "system"),
+    ("thinking", "thinking"),
+    ("tool", "tool calls"),
+    ("note", "notes"),
+    ("attachment", "attachments"),
+    ("api", "API requests"),
+    ("loop", "loops"),
+    ("procedure", "procedures"),
+)
+RAW_LABELS = (
+    ("user", "user messages"),
+    ("assistant", "assistant messages"),
+    ("system", "system messages"),
+    ("text", "text blocks"),
+    ("thinking", "thinking blocks"),
+    ("tool_use", "tool_use blocks"),
+    ("tool_result", "tool_result blocks"),
+    ("other", "other blocks"),
+)
+
+
+@dataclass
+class ViewOptions:
+    """Settings for the viewer, edited before vim opens."""
+    max_messages: int = 6  # -1 = all API request messages with full content, 0 = none
+    normal_parts: tuple[str, ...] = NORMAL_PARTS
+    raw_parts: tuple[str, ...] = RAW_PARTS
+    raw: bool = False
+    accumulative: bool = False
+
+
 def file_size(path: Path) -> int:
     """Size of a transcript file, decompressed when it is stored as .zst; zero if it is missing."""
     try:
@@ -121,7 +162,7 @@ class Agent:
         """User text, assistant text and one-line tool markers, in order."""
         raise NotImplementedError
 
-    def view(self, s: Session, view: "ViewBuilder", tmpdir: Path) -> None:
+    def view(self, s: Session, view: "ViewBuilder", tmpdir: Path, options: ViewOptions) -> None:
         """Render s into the viewer's buffer as folded sections."""
         raise NotImplementedError
 
@@ -190,8 +231,8 @@ class ClaudeAgent(Agent):
     def resume(self, s: Session) -> None:
         exec_agent(s, ["claude", "--resume", s.id])
 
-    def view(self, s: Session, view: "ViewBuilder", tmpdir: Path) -> None:
-        claude_view(s, view, tmpdir)
+    def view(self, s: Session, view: "ViewBuilder", tmpdir: Path, options: ViewOptions) -> None:
+        claude_view(s, view, tmpdir, options)
 
     def transcript(self, s: Session) -> list[Turn]:
         records = list(read_jsonl(s.path))
@@ -337,7 +378,7 @@ class CodexAgent(Agent):
     def resume(self, s: Session) -> None:
         exec_agent(s, ["codex", "resume", s.id])
 
-    def view(self, s: Session, view: "ViewBuilder", tmpdir: Path) -> None:
+    def view(self, s: Session, view: "ViewBuilder", tmpdir: Path, options: ViewOptions) -> None:
         codex_view(s, view, tmpdir)
 
     def transcript(self, s: Session) -> list[Turn]:
@@ -430,7 +471,7 @@ class OpenCodeAgent(Agent):
     def resume(self, s: Session) -> None:
         exec_agent(s, ["opencode", "--session", s.id])
 
-    def view(self, s: Session, view: "ViewBuilder", tmpdir: Path) -> None:
+    def view(self, s: Session, view: "ViewBuilder", tmpdir: Path, options: ViewOptions) -> None:
         opencode_view(self, s, view, tmpdir)
 
     def messages(self, s: Session) -> list[tuple[str, dict]]:
@@ -1287,6 +1328,105 @@ def ask_enter(prompt: str) -> bool:
         out.flush()
 
 
+def edit_view_options(options: ViewOptions) -> ViewOptions | None:
+    """Menu shown by v; Enter returns the options (the caller opens vim), Esc backs out.
+
+    Every checkbox toggles with Space, including the mode and accumulative rows;
+    the API body size uses Left/Right."""
+    opts = ViewOptions(
+        options.max_messages, tuple(options.normal_parts), tuple(options.raw_parts),
+        options.raw, options.accumulative,
+    )
+
+    def rows() -> list[tuple[str, str, str]]:
+        out = [("raw", f"[{'x' if opts.raw else ' '}] raw mode", "check")]
+        if opts.raw:
+            out.append(
+                ("accum", f"[{'x' if opts.accumulative else ' '}] accumulative", "check")
+            )
+            selected = opts.raw_parts
+            labels = RAW_LABELS
+        else:
+            out.append(
+                (
+                    "limit",
+                    f"API body messages: {opts.max_messages}  (-1 = all, 0 = none)",
+                    "number",
+                )
+            )
+            selected = opts.normal_parts
+            labels = NORMAL_LABELS
+        for key, label in labels:
+            out.append((key, f"[{'x' if key in selected else ' '}] {label}", "check"))
+        return out
+
+    sel = 0
+    out = sys.stdout
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    tty.setcbreak(fd)
+    try:
+        while True:
+            items = rows()
+            sel = min(sel, len(items) - 1)
+            lines = ["View options (Enter open vim, Esc back):"]
+            for i, (_, text, _) in enumerate(items):
+                prefix = "> " if i == sel else "  "
+                text = f"\x1b[7m{text}\x1b[27m" if i == sel else text
+                lines.append(prefix + text)
+            lines.append("Space: toggle   Left/Right: size")
+            height = len(lines)
+            out.write(
+                "\x1b[J" + "".join(f"\r\x1b[K{line}\n" for line in lines)
+                + f"\x1b[{height}A"
+            )
+            out.flush()
+            key = read_key(fd)
+            if key in ("\r", "\n"):
+                return opts
+            if key in ("esc", "\x0f"):  # Ctrl+O
+                return None
+            if key in ("up", "k"):
+                sel = (sel - 1) % len(items)
+                continue
+            if key in ("down", "j"):
+                sel = (sel + 1) % len(items)
+                continue
+            if key not in ("left", "h", "right", "l", " "):
+                continue
+            name, _, kind = items[sel]
+            step = -1 if key in ("left", "h") else 1 if key in ("right", "l") else 0
+            if kind == "number":
+                if step:
+                    opts.max_messages = max(-1, min(999, opts.max_messages + step))
+            elif name == "raw":
+                if key == " " or step:
+                    opts.raw = not opts.raw
+                    sel = 0
+            elif name == "accum":
+                if key == " " or step:
+                    opts.accumulative = not opts.accumulative
+            elif key == " ":
+                labels = RAW_LABELS if opts.raw else NORMAL_LABELS
+                current = opts.raw_parts if opts.raw else opts.normal_parts
+                picked = [k for k, _ in labels if k in current]
+                if name in picked:
+                    picked.remove(name)
+                else:
+                    picked.append(name)
+                picked = tuple(k for k, _ in labels if k in picked)
+                if opts.raw:
+                    opts.raw_parts = picked
+                else:
+                    opts.normal_parts = picked
+    except KeyboardInterrupt:
+        return None
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        out.write("\r\x1b[J")
+        out.flush()
+
+
 CLAUDE_VIEW_LINES = 300  # a longer tool output shows this many lines; the rest is spilled to a file
 VIEW_ATTACHMENTS = {
     "instructions",
@@ -1528,6 +1668,50 @@ def message_summary(message: dict) -> str:
     return f"{role}: {text[:160]}{'…' if len(text) > 160 else ''}"
 
 
+def block_kind(block) -> str:
+    """The selectable kind of a request content block."""
+    kind = block.get("type") if isinstance(block, dict) else None
+    return kind if kind in ("text", "thinking", "tool_use", "tool_result") else "other"
+
+
+def message_lines(index: int, message: dict, marker: str = "", parts=None) -> list[str]:
+    """A full request message in readable form. parts filters block kinds (None = all)."""
+    role = message.get("role") or "?"
+    content = message.get("content")
+    body: list[str] = []
+    if isinstance(content, str):
+        if parts is None or "text" in parts:
+            body.extend(content.splitlines() or [""])
+    elif isinstance(content, list):
+        for block in content:
+            kind = block_kind(block)
+            if parts is not None and kind not in parts:
+                continue
+            if not isinstance(block, dict):
+                body.extend(str(block).splitlines())
+            elif kind == "text":
+                body.extend((block.get("text") or "").splitlines() or [""])
+            elif kind == "thinking":
+                body.append("THINKING:")
+                body.extend((block.get("thinking") or block.get("text") or "").splitlines())
+            elif kind == "tool_use":
+                body.append(f"TOOL_USE {block.get('name') or '?'}:")
+                body.extend(
+                    json.dumps(block.get("input") or {}, ensure_ascii=False, indent=2).splitlines()
+                )
+            elif kind == "tool_result":
+                body.append("TOOL_RESULT" + (" (error)" if block.get("is_error") else "") + ":")
+                body.extend(text_of(block.get("content")).splitlines() or [""])
+            else:
+                body.append(f"[{block.get('type') or 'block'}]")
+                body.extend(json.dumps(block, ensure_ascii=False, indent=2).splitlines())
+    elif parts is None or "other" in parts:
+        body.extend(str(content or "").splitlines() or [""])
+    if parts is not None and content not in (None, "", []) and not body:
+        return []  # every part of this message was deselected
+    return [f"[{index}]{marker} {role}"] + body
+
+
 def claude_message_hash(message: dict) -> str:
     """Claude Code's hash for a request message (the api-request-blob key)."""
     canonical = json.dumps(message, separators=(",", ":"), ensure_ascii=False, sort_keys=True)
@@ -1622,24 +1806,8 @@ class RequestBody:
         return body
 
 
-def claude_request_body(
-    records: list[dict],
-    request: dict,
-    blobs: dict[str, dict] | None = None,
-    shapes: dict[str, dict] | None = None,
-    requests: dict[str, dict] | None = None,
-) -> RequestBody:
-    """Reconstruct the complete body of one logged API request.
-
-    A request is logged as a delta: params, a shape (system/tools) and message
-    hashes in tail, with base pointing at the previous request. Walking that
-    chain and keeping the last `keep` carried messages yields every hash sent.
-    Bodies come from api-request-blob; the ones the log omitted are rebuilt from
-    ordinary user/assistant records and verified against their hash. cacheControl
-    paths are reattached to the blocks they mark."""
-    if blobs is None or shapes is None or requests is None:
-        blobs, shapes, requests = claude_request_indexes(records)
-
+def claude_sent_hashes(request: dict, requests: dict[str, dict]) -> list[str]:
+    """The message hashes of one request: the last `keep` of its base chain + tail."""
     chain: list[dict] = []
     seen: set[str] = set()
     current: dict | None = request
@@ -1660,10 +1828,41 @@ def claude_request_body(
     tail = [h for h in (request.get("tail") or []) if isinstance(h, str)]
     keep = request.get("keep")
     keep = keep if isinstance(keep, int) and keep >= 0 else len(base_hashes)
-    sent = (base_hashes[-keep:] if keep else []) + tail
+    return (base_hashes[-keep:] if keep else []) + tail
+
+
+def claude_request_body(
+    records: list[dict],
+    request: dict,
+    blobs: dict[str, dict] | None = None,
+    shapes: dict[str, dict] | None = None,
+    requests: dict[str, dict] | None = None,
+    rebuilt: dict[str, dict] | None = None,
+) -> RequestBody:
+    """Reconstruct the complete body of one logged API request.
+
+    A request is logged as a delta: params, a shape (system/tools) and message
+    hashes in tail, with base pointing at the previous request. Walking that
+    chain and keeping the last `keep` carried messages yields every hash sent.
+    Bodies come from api-request-blob; the ones the log omitted are rebuilt from
+    ordinary user/assistant records and verified against their hash. cacheControl
+    paths are reattached to the blocks they mark. Callers rendering many requests
+    should pass a shared `rebuilt` cache."""
+    if blobs is None or shapes is None or requests is None:
+        blobs, shapes, requests = claude_request_indexes(records)
+
+    sent = claude_sent_hashes(request, requests)
 
     missing_hashes = {h for h in sent if h not in blobs}
-    rebuilt = claude_rebuild_messages(records, missing_hashes) if missing_hashes else {}
+    if missing_hashes:
+        if rebuilt is None:
+            rebuilt = claude_rebuild_messages(records, missing_hashes)
+        else:
+            needed = missing_hashes - set(rebuilt)
+            if needed:
+                rebuilt.update(claude_rebuild_messages(records, needed))
+    else:
+        rebuilt = rebuilt or {}
 
     messages = []
     missing = []
@@ -1712,76 +1911,58 @@ def claude_request_body(
     return RequestBody(params, system, tools, messages, cache_control, missing)
 
 
-def render_request(view, rec, blobs, shapes, by_id) -> None:
-    """One folded section for an API request: shape plus the head/tail of its content."""
-
-    def messages(hashes):
-        if not isinstance(hashes, list):
-            return []
-        return [blobs[h] for h in hashes if h in blobs]
-
-    def first_messages(request_id):
-        """The earliest content in the request's base chain, so the range is visible."""
-        chain, seen, cur = [], set(), request_id
-        while cur and cur in by_id and cur not in seen:
-            chain.append(cur)
-            seen.add(cur)
-            cur = by_id[cur].get("base")
-        for item in reversed(chain):
-            found = messages(by_id[item].get("tail"))
-            if found:
-                return found
-        return []
-
-    params = rec.get("params")
-    params = params if isinstance(params, dict) else {}
-    tail = messages(rec.get("tail"))
+def render_request(view, rec, records, blobs, shapes, by_id, rebuilt, options) -> None:
+    """One folded section for an API request: params, shape and selected messages."""
+    body = claude_request_body(records, rec, blobs, shapes, by_id, rebuilt)
+    params = body.params
     base = rec.get("base")
     base = base if isinstance(base, str) else None
-    head = first_messages(base) if base else []
-    body = ["params:"]
-    body.extend(json.dumps(params, ensure_ascii=False, indent=2).splitlines())
+    lines = ["params:"]
+    lines.extend(json.dumps(params, ensure_ascii=False, indent=2).splitlines())
     shape_hash = rec.get("shapeHash")
-    shape = shapes.get(shape_hash) if isinstance(shape_hash, str) else None
-    shape = shape if isinstance(shape, dict) else {}
-    system = shape.get("system") or []
-    tools = shape.get("tools") or []
-    body.append(
-        f"shape {(shape_hash or '')[:8]}:" f" system={len(system)} tool(s)={len(tools)}"
+    lines.append(
+        f"shape {(shape_hash or '')[:8]}: system={len(body.system)} tool(s)={len(body.tools)}"
     )
     system_text = "\n".join(
-        block.get("text", "") for block in system if isinstance(block, dict)
+        block.get("text", "") for block in body.system if isinstance(block, dict)
     )
     if system_text.strip():
-        body.append("system:")
-        body.extend(head_tail(system_text.splitlines(), 5))
-    if tools:
-        names = [tool.get("name") or "?" for tool in tools if isinstance(tool, dict)]
-        body.append("tools: " + ", ".join(names))
-    if head and tail:
-        body.append("content from the first request to this one:")
-        body.extend(message_summary(message) for message in head[:3])
-        body.append("......")
-        body.extend(message_summary(message) for message in tail[-3:])
-    elif head:
-        body.append("content (carried over; no new messages):")
-        body.extend(message_summary(message) for message in head[:3])
-        body.append("......")
-    elif tail:
-        body.append("content:")
-        if len(tail) > 6:
-            body.extend(message_summary(message) for message in tail[:3])
-            body.append("......")
-            body.extend(message_summary(message) for message in tail[-3:])
-        else:
-            body.extend(message_summary(message) for message in tail)
+        lines.append("system:")
+        lines.extend(head_tail(system_text.splitlines(), 5))
+    if body.tools:
+        names = [tool.get("name") or "?" for tool in body.tools if isinstance(tool, dict)]
+        lines.append("tools: " + ", ".join(names))
+    if body.missing:
+        lines.append(f"missing bodies: {len(body.missing)}")
+    selected = [
+        (i, message) for i, message in enumerate(body.messages)
+        if message.get("role") in options.normal_parts or message.get("role") == "missing"
+    ]
+    limit = options.max_messages
+    if limit == 0 or not selected:
+        lines.append("content: (none)")
+    elif limit < 0:
+        lines.append(f"content ({len(selected)} messages, full):")
+        for index, message in selected:
+            lines.extend(message_lines(index, message))
     else:
-        body.append("content: (none)")
+        lines.append(f"content ({len(selected)} messages):")
+        if len(selected) <= limit:
+            lines.extend(message_summary(message) for _, message in selected)
+        else:
+            first = (limit + 1) // 2
+            last = limit - first
+            head = selected[:first]
+            tail = selected[-last:] if last else []
+            lines.extend(message_summary(message) for _, message in head)
+            if len(head) + len(tail) < len(selected):
+                lines.append("......")
+            lines.extend(message_summary(message) for _, message in tail)
     base_label = f" base={(base or '')[:8]}" if base else ""
     view.section(
         f"{record_ts(rec)} API request model={params.get('model', '?')}"
-        f"{base_label} tail={len(tail)}",
-        body,
+        f"{base_label} messages={len(body.messages)}",
+        lines,
     )
 
 
@@ -1807,8 +1988,10 @@ class TurnBuilder:
         else:
             self.turn["pre"].append(item)
 
-    def add_note(self, header: str, body: list[str]) -> None:
-        self.add_item({"kind": "note", "header": header, "body": body})
+    def add_note(self, header: str, body: list[str], category: str = "note") -> None:
+        self.add_item(
+            {"kind": "note", "category": category, "header": header, "body": body}
+        )
 
     def add_thinking(self, ts: str, tag: str, label: str, text: str) -> None:
         item = {"kind": "thinking", "ts": ts, "tag": tag, "label": label, "text": text}
@@ -1875,11 +2058,20 @@ def final_text_for(turn: dict) -> dict | None:
     return None
 
 
-def render_item(view, item, tmpdir, final) -> None:
+def render_item(view, item, tmpdir, final, parts=None) -> None:
     """Render one loop item; the final assistant text is left for render_turn."""
     if item is final:
         return
     kind = item["kind"]
+    if parts is not None:
+        if kind == "thinking" and "thinking" not in parts:
+            return
+        if kind == "call" and "tool" not in parts:
+            return
+        if kind == "text" and "assistant" not in parts:
+            return
+        if kind == "note" and item.get("category", "note") not in parts:
+            return
     if kind == "thinking":
         add_thinking(view, item)
     elif kind == "call":
@@ -1893,36 +2085,42 @@ def render_item(view, item, tmpdir, final) -> None:
         view.section(item["header"], item["body"])
 
 
-def render_loop(view, loop, tmpdir, final, draw_request=None) -> None:
-    """One model-response loop, folded as a block."""
+def render_loop(view, loop, tmpdir, final, draw_request=None, parts=None) -> None:
+    """One model-response loop, folded as a block. parts filters section kinds."""
     requests = loop["requests"]
     items = loop["items"]
+    show_loop = parts is None or "loop" in parts
     thinking = sum(1 for item in items if item["kind"] == "thinking")
     calls = sum(1 for item in items if item["kind"] == "call")
     texts = sum(1 for item in items if item["kind"] == "text")
-    parts = []
+    parts_list = []
     if requests:
-        parts.append("API request" if len(requests) == 1 else f"{len(requests)} API requests")
+        parts_list.append("API request" if len(requests) == 1 else f"{len(requests)} API requests")
     if thinking:
-        parts.append(f"{thinking} thinking")
+        parts_list.append(f"{thinking} thinking")
     if calls:
-        parts.append(f"{calls} tool call{'s' if calls != 1 else ''}")
-    if texts and not parts:
-        parts.append(f"{texts} assistant text{'s' if texts != 1 else ''}")
+        parts_list.append(f"{calls} tool call{'s' if calls != 1 else ''}")
+    if texts and not parts_list:
+        parts_list.append(f"{texts} assistant text{'s' if texts != 1 else ''}")
     start = len(view.lines) + 1
-    view.lines.append(f"{loop['ts']} LOOP: " + (" · ".join(parts) or "items"))
-    if draw_request is not None:
+    if show_loop:
+        view.lines.append(f"{loop['ts']} LOOP: " + (" · ".join(parts_list) or "items"))
+    if draw_request is not None and (parts is None or "api" in parts):
         for rec in requests:
             draw_request(view, rec)
     for item in items:
-        render_item(view, item, tmpdir, final)
-    if len(view.lines) > start:
+        render_item(view, item, tmpdir, final, parts)
+    if show_loop and len(view.lines) > start:
         view.folds.append((start, len(view.lines)))
-    view.lines.append("")
+    if show_loop:
+        view.lines.append("")
 
 
-def render_turn(view, turn, tmpdir, draw_request=None) -> None:
-    """USER, its repeated loops (one PROCEDURE fold), then the final ASSISTANT text."""
+def render_turn(view, turn, tmpdir, draw_request=None, parts=None) -> None:
+    """USER, its repeated loops (one PROCEDURE fold), then the final ASSISTANT text.
+
+    parts filters section kinds: user, assistant, thinking, tool, note,
+    attachment, api, loop, procedure."""
     if (
         turn["user"] is None
         and not turn["pre"]
@@ -1939,28 +2137,29 @@ def render_turn(view, turn, tmpdir, draw_request=None) -> None:
         if loop["requests"] or any(item is not final for item in loop["items"])
     ]
     user = turn["user"]
-    if user is not None:
+    if user is not None and (parts is None or "user" in parts):
         message_section(view, user["ts"], user["tag"], user["label"], user["text"])
     pre = turn["pre"]
-    if len(loops) > 1 or (loops and pre):
+    procedure = parts is None or "procedure" in parts
+    if procedure and (len(loops) > 1 or (loops and pre)):
         start = len(view.lines) + 1
         count = len(loops)
         view.lines.extend(
             [f"{loops[0]['ts']} PROCEDURE ({count} loop{'s' if count != 1 else ''})", ""]
         )
         for item in pre:
-            render_item(view, item, tmpdir, final)
+            render_item(view, item, tmpdir, final, parts)
         for loop in loops:
-            render_loop(view, loop, tmpdir, final, draw_request)
+            render_loop(view, loop, tmpdir, final, draw_request, parts)
         view.folds.append((start, len(view.lines)))
         view.lines.append("")
     else:
         for item in pre:
-            render_item(view, item, tmpdir, final)
+            render_item(view, item, tmpdir, final, parts)
         for loop in loops:
-            render_loop(view, loop, tmpdir, final, draw_request)
+            render_loop(view, loop, tmpdir, final, draw_request, parts)
     if final is not None:
-        render_item(view, final, tmpdir, None)
+        render_item(view, final, tmpdir, None, parts)
 
 
 def claude_active_uuids(records: list[dict]) -> set[str] | None:
@@ -2032,12 +2231,50 @@ def claude_active_requests(records: list[dict], active: set[str] | None) -> set[
     return live
 
 
-def claude_view(s: Session, view: "ViewBuilder", tmpdir: Path) -> None:
+def render_raw_view(
+    view, records, live, blobs, shapes, requests_by_id, rebuilt, options: ViewOptions
+) -> None:
+    """Only the reconstructed API request messages, as sent to the model.
+
+    Accumulative shows every request's whole prefix, marking the messages added
+    since the previous request; otherwise only the latest request is shown."""
+    if not live:
+        view.section("API request bodies", ["(no API requests)"])
+        return
+    if not options.accumulative:
+        live = live[-1:]
+    previous: set[str] = set()
+    for rec in live:
+        sent = claude_sent_hashes(rec, requests_by_id)
+        body = claude_request_body(records, rec, blobs, shapes, requests_by_id, rebuilt)
+        new = set(sent) - previous if options.accumulative else set()
+        header = (
+            f"{record_ts(rec)} API request body ({len(body.messages)} messages"
+            + (f", +{len(new)} new" if options.accumulative else "")
+            + ")"
+        )
+        lines = []
+        if body.missing:
+            lines.append(f"missing bodies: {len(body.missing)}")
+        parts = set(options.raw_parts)
+        for index, (message_hash, message) in enumerate(zip(sent, body.messages)):
+            role = message.get("role") or "?"
+            if role != "missing" and role not in parts:
+                continue
+            lines.extend(
+                message_lines(index, message, "+" if message_hash in new else "", parts)
+            )
+        view.section(header, lines or ["(empty)"])
+        previous = set(sent)
+
+
+def claude_view(s: Session, view: "ViewBuilder", tmpdir: Path, options: ViewOptions) -> None:
     """Render a Claude session into view.
 
     Shows user/assistant text, thinking, grouped tool calls with their results,
     system notes, selected injected attachments and API requests. Raw tool
-    results, thinking and attachments are what transcript() drops."""
+    results, thinking and attachments are what transcript() drops. With
+    options.raw, only the reconstructed API request messages are shown."""
     records = list(read_jsonl(s.path))
     active = claude_active_uuids(records)
     live_requests = claude_active_requests(records, active)
@@ -2064,10 +2301,9 @@ def claude_view(s: Session, view: "ViewBuilder", tmpdir: Path) -> None:
             if isinstance(rec.get("shapeHash"), str) and isinstance(rec.get("shape"), dict):
                 shapes[rec["shapeHash"]] = rec["shape"]
         elif kind == "api-request":
-            if i in live_requests:
-                request_id = rec.get("id")
-                if isinstance(request_id, str):
-                    requests_by_id[request_id] = rec
+            request_id = rec.get("id")
+            if isinstance(request_id, str):
+                requests_by_id[request_id] = rec
         elif kind == "user":
             if rewound(rec):
                 continue
@@ -2075,11 +2311,26 @@ def claude_view(s: Session, view: "ViewBuilder", tmpdir: Path) -> None:
                 if block.get("type") == "tool_result":
                     results[block.get("tool_use_id")] = (block, rec)
 
+    live_records = [
+        rec for i, rec in enumerate(records)
+        if rec.get("type") == "api-request" and i in live_requests
+    ]
+    all_missing = {
+        h for rec in live_records for h in claude_sent_hashes(rec, requests_by_id)
+        if h not in blobs
+    }
+    rebuilt = claude_rebuild_messages(records, all_missing) if all_missing else {}
+
     view_header(view, s)
+    if options.raw:
+        render_raw_view(
+            view, records, live_records, blobs, shapes, requests_by_id, rebuilt, options
+        )
+        return
     builder = TurnBuilder()
 
     def draw_request(v, rec: dict) -> None:
-        render_request(v, rec, blobs, shapes, requests_by_id)
+        render_request(v, rec, records, blobs, shapes, requests_by_id, rebuilt, options)
 
     def add_call_item(block: dict, ts: str, tag: str) -> None:
         result, rec = results.get(block.get("id"), (None, None))
@@ -2095,7 +2346,7 @@ def claude_view(s: Session, view: "ViewBuilder", tmpdir: Path) -> None:
         )
 
     def flush_turn() -> None:
-        render_turn(view, builder.turn, tmpdir, draw_request)
+        render_turn(view, builder.turn, tmpdir, draw_request, set(options.normal_parts))
         builder.reset()
 
     for i, rec in enumerate(records):
@@ -2211,6 +2462,7 @@ def claude_view(s: Session, view: "ViewBuilder", tmpdir: Path) -> None:
                 builder.add_note(
                     f"{ts} {tag}attachment: {attachment.get('type')}",
                     text.splitlines(),
+                    category="attachment",
                 )
             continue
     flush_turn()
@@ -2428,8 +2680,9 @@ def vim_viewer_script(folds: list[tuple[int, int]]) -> str:
     return "\n".join(setup + create + finish) + "\n"
 
 
-def view_session(s: Session) -> None:
+def view_session(s: Session, options: ViewOptions | None = None) -> None:
     """Render a session and open it in vim with every section folded."""
+    options = options or ViewOptions()
     vim = shutil.which("vim") or shutil.which("nvim")
     if vim is None:
         print("vim not found; cannot open the viewer", file=sys.stderr)
@@ -2438,7 +2691,7 @@ def view_session(s: Session) -> None:
     try:
         view = ViewBuilder()
         try:
-            agent_of(s).view(s, view, tmpdir)
+            agent_of(s).view(s, view, tmpdir, options)
         except OSError as e:  # the transcript vanished or the spill file cannot be written
             print(f"Cannot read {s.path}: {e}", file=sys.stderr)
             return
@@ -2489,6 +2742,7 @@ def interactive_menu(cwd: Path | None) -> int:
     focus: Session | None = None
     sort: tuple[str, bool] | None = None  # kept across pages: backing out restores the order
     base: list[Session] | None = None  # a submenu's sessions; None = every session for cwd
+    view_options = ViewOptions()  # v's settings; the pre-vim menu edits them
 
     def rebuild_rows() -> list[Session]:
         """The page's sessions, in the order rows are shown now; unseen ones last.
@@ -2566,7 +2820,11 @@ def interactive_menu(cwd: Path | None) -> int:
             marks = []
             continue
         if kind == "view":
-            view_session(payload)
+            changed = edit_view_options(view_options)
+            if changed is None:  # Esc at the menu: back to the picker
+                continue
+            view_options = changed
+            view_session(payload, view_options)
             continue
         if isinstance(payload, Session):
             return resume_session(payload)
