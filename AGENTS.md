@@ -1,9 +1,9 @@
 # lmsessions — code map for agents
 
 Single executable Python 3.10+ script (`./lmsessions`, stdlib only). Lists,
-searches, views, dumps, removes and resumes coding-agent sessions (Claude Code,
-Codex, OpenCode, Google Antigravity), either as a plain list or an inline
-interactive picker. No tests, no build step; verify by running it.
+searches, views, removes and resumes coding-agent sessions (Claude Code, Codex,
+OpenCode, Google Antigravity), either as a plain list or an inline interactive
+picker. No tests, no build step; verify by running it.
 
 ## Entry point
 
@@ -85,7 +85,7 @@ instead of calling that method.
 - `transcript()` normalizes each agent's format to `(role, ts, body)` with
   tool calls reduced to one-line `tool_marker` text. Raw tool results and
   reasoning/thinking are dropped. Claude's transcript also skips records off the
-  live branch (see the viewer section), so search and dump omit rewound content.
+  live branch (see the viewer section), so search omits rewound content.
 - `resume()` → `exec_agent()`: chdir to the session's `cwd` (if it still
   exists) and `execvp` the agent CLI. It replaces the process, so it never
   returns; `resume_session()` only catches `OSError`.
@@ -100,16 +100,11 @@ sorted column and appends `↑`/`↓` inside it (or in the following gap when th
 label already fills the width, as PROMPTS does); the escapes are zero-width, so
 click spans are unaffected.
 
-## Listing / search / dump
+## Listing / search
 
 - `list_sessions()` prints the header plus one `format_row` per session.
 - `find_hits(s, rx)` searches the title and every transcript line, returning
   de-duplicated ±120-char snippets (`snippet`).
-- `dump_session()` merges consecutive ASSISTANT turns and writes
-  `── [ts] ROLE ──` blocks. `dump_selected()` renames each file (one line per
-  session, `<id>.txt` or `<id>_dump.txt` by default; Up/Down pick a file,
-  Left/Right move the text cursor, Enter dumps, Esc backs out); backing out
-  keeps the selection.
 
 ## Session viewer (`v`)
 
@@ -172,6 +167,18 @@ user text, `turn_duration`, most attachment types (`VIEW_ATTACHMENTS` is the
 whitelist) and the duplicated `api-request-blob`/`api-request-shape` records are
 skipped.
 
+`claude_request_body()` reconstructs one request's complete sendable body: walk
+`base` to the root, take the last `keep` messages of the chain, append `tail`,
+resolve each hash from `api-request-blob`, and — for bodies the log omitted —
+rebuild it from contiguous same-role user/assistant records (a string content
+becomes a `text` block) and verify it with `claude_message_hash()` (SHA-256 of
+compact, sorted-key JSON). It reattaches `cacheControl` paths to the blocks they
+mark, parses the stringified tool `input_schema`, and returns a `RequestBody`
+(`payload()` strips `betas`, which is a request option, not a body field).
+Unrecoverable hashes become placeholders and are listed in `missing`. The viewer
+does not use it yet; `render_request()` still renders its compact head/tail
+summary.
+
 A rewind leaves the abandoned branch in the jsonl. `claude_active_uuids()` keeps
 only records on the live branch: start from the newest conversation record (or
 the last-prompt leaf when that record is newer, for a rewind with no new
@@ -213,7 +220,7 @@ Keys: `j/k`/up/down arrows move, `Ctrl+f/b` page, `g/G` first/last,
 `J/K`/Shift-arrows toggle the row stepped onto, plus the row being left when the
 run starts or reverses direction (so holding it toggles a run and reversing
 un-toggles it back; at a list end a held key does nothing), `Space` toggle the
-current row, `y` copy id, `/` incremental search, `d` dump, `v` open the session
+current row, `y` copy id, `/` incremental search, `v` open the session
 viewer, `Delete` remove, `Enter` resume — or, with several rows marked, open a
 submenu of just those rows — `q` quit, `Esc` quit (or back when `hits` is set
 or `can_back` says the page was opened from another). Clicking a
@@ -234,7 +241,7 @@ drifts there. Holding each notch costs every notch one gap of latency.
 
 Returns `(action, payload, current, sort)` where `sort` is the
 `(attribute, reverse)` the list ended up in:
-`remove`/`dump` → the picker's `marks` (possibly empty; the caller falls back
+`remove` → the picker's `marks` (possibly empty; the caller falls back
 to `current`); `submenu` → the marked `Session`s; `resume`/`view` → the
 `Session`; `search` → pattern; `back` → `None`; `None` → cancelled. Passing
 `sort` back in re-sorts `rows` to it, so the order survives every return to the
@@ -250,7 +257,7 @@ Additional searches compose:
 `filters` is cumulative (rows must match all regexes, case-insensitive), and
 `hits` shown always come from the latest filter. The picker's `sort` is kept
 here and handed back to every picker invocation, so the order survives search,
-back, dump and removal.
+back and removal.
 
 After a removal it keeps the history stack, pruning the removed sessions from
 every page (and dropping a page left empty), so `Esc` still walks back through

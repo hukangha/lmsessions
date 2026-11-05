@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
-"""List, search, remove, dump or resume coding-agent sessions (Claude Code,
-Codex, OpenCode, Antigravity). With no arguments, open the interactive menu; -l
-lists them instead; -a covers every directory, not just $PWD. Press / in the
-menu to search.
+"""List, search, remove or resume coding-agent sessions (Claude Code, Codex,
+OpenCode, Antigravity). With no arguments, open the interactive menu; -l lists
+them instead; -a covers every directory, not just $PWD. Press / in the menu to
+search.
 
 To support another agent, subclass `Agent` and add an instance to `AGENTS`.
 """
 
 import argparse
+import ast
 import base64
+import copy
+import hashlib
 import json
 import os
 import re
@@ -808,28 +811,6 @@ def find_hits(s: Session, rx: re.Pattern) -> list[Hit]:
     return list(dict.fromkeys(snippet(l.strip(), m) for l in lines if (m := rx.search(l.strip()))))
 
 
-def dump_session(s: Session, out: Path) -> None:
-    """Write a clean, readable dump of a session transcript to out.
-
-    Keeps real user-typed text, assistant text, and compact one-line tool
-    markers. Drops thinking/reasoning and raw tool results. Groups
-    consecutive assistant records into a single response block.
-    """
-    # Merge consecutive ASSISTANT turns into one block (keep first ts).
-    merged = []
-    for role, ts, body in agent_of(s).transcript(s):
-        if merged and role == "ASSISTANT" and merged[-1][0] == "ASSISTANT":
-            merged[-1] = (role, merged[-1][1], merged[-1][2] + "\n" + body)
-        else:
-            merged.append((role, ts, body))
-
-    with out.open("w") as o:
-        for role, ts, body in merged:
-            o.write(f"\n{'─'*6} [{ts}] {role} {'─'*6}\n{body}\n")
-
-    print(f"{len(merged)} turns written to {out}")
-
-
 def confirm_remove(rows: list[Session], cwd: Path | None) -> str:
     """Confirm then remove rows; returns 'removed', or 'back' if Esc was pressed."""
     cw = cwd_width(rows, cwd)
@@ -947,8 +928,8 @@ def pick_sessions(
     the session to highlight on start. sort is the (attribute, reverse) the list
     was last shown in; rows are re-sorted to it when given. can_back makes Esc
     back out even without snippets. Returns (action, payload, current, sort)
-    where action is 'remove'|'dump' (the marked row indexes, possibly empty) on
-    Delete/d, 'submenu' (the marked sessions) on Enter when several are marked,
+    where action is 'remove' (the marked row indexes, possibly empty) on
+    Delete, 'submenu' (the marked sessions) on Enter when several are marked,
     'resume' (session) on Enter, 'view' (session) on v, 'search' (pattern) on
     / + Enter, 'back' (None) on Esc from a search page (or when can_back), or
     None on q/Esc at the top level."""
@@ -965,14 +946,14 @@ def pick_sessions(
     marks = list(marks or [])  # row indexes
     if marks:  # resumed after Esc at the confirmation: start at the first mark
         cur = min(marks)
-    if focus is not None:  # resumes after backing out of dump/removal/search
+    if focus is not None:  # resumes after backing out of removal/search
         cur = next(
             (i for i, r in enumerate(rows) if (r.agent, r.id) == (focus.agent, focus.id)), cur
         )
     quit_hint = "quit:q back:Esc" if hits is not None or can_back else "quit:q/Esc"
     footer = (
         "move:j/k,↓/↑ search:/ page:Ctrl+f/b top/bottom:g/G title:h/l,←→/Tab sort:s toggle:Shift+j/k,Space"
-        f" copy-id:y dump:d view:v delete:del goto/open:Enter {quit_hint}"
+        f" copy-id:y view:v delete:del goto/open:Enter {quit_hint}"
     )
     status = ""  # footer message, e.g. after yanking an id
     shift_dir: int | None = None  # direction of the current Shift+j/k run
@@ -1248,8 +1229,6 @@ def pick_sessions(
                 if agent_of(rows[cur]).viewable:
                     return "view", rows[cur], rows[cur], (sort_attr, reverse)
                 status = f"The viewer does not support {rows[cur].agent} sessions yet"
-            elif key == "d":
-                return "dump", marks, rows[cur], (sort_attr, reverse)
             elif key == "delete":
                 return "remove", marks, rows[cur], (sort_attr, reverse)
             elif key in ("\r", "\n"):
@@ -1306,68 +1285,6 @@ def ask_enter(prompt: str) -> bool:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
         out.write("\r\x1b[K")
         out.flush()
-
-
-def rename_dump(names: list[str]) -> list[str] | None:
-    """Rename each dump file on its own line; None if Esc or Ctrl+O backs out.
-
-    Up/Down pick a file, Left/Right move the cursor within it, Enter dumps."""
-    names = list(names)
-    pos = [len(n) for n in names]  # cursor position, one per name
-    sel = 0
-    out = sys.stdout
-    fd = sys.stdin.fileno()
-    old = termios.tcgetattr(fd)
-    tty.setcbreak(fd)
-    height = len(names) + 2
-    try:
-        while True:
-            lines = [f"Dump {len(names)} session(s) as:"]
-            for i, name in enumerate(names):
-                if i == sel:
-                    c = pos[i]
-                    name = f"{name[:c]}\x1b[7m{name[c:c + 1] or ' '}\x1b[0m{name[c + 1:]}"
-                lines.append(f"{'>' if i == sel else ' '} {name}")
-            lines.append("[Enter/Esc]")
-            out.write("".join(f"\r\x1b[K{line}\n" for line in lines) + f"\x1b[{height}A")
-            out.flush()
-            key = read_key(fd)
-            if key in ("\r", "\n"):
-                return names
-            if key in ("esc", "\x0f"):  # Ctrl+O
-                return None
-            if key in ("up", "down"):
-                sel = min(max(sel + (1 if key == "down" else -1), 0), len(names) - 1)
-            elif key == "left":
-                pos[sel] = max(0, pos[sel] - 1)
-            elif key == "right":
-                pos[sel] = min(len(names[sel]), pos[sel] + 1)
-            elif key in ("\x7f", "\b"):
-                if pos[sel]:
-                    names[sel] = names[sel][:pos[sel] - 1] + names[sel][pos[sel]:]
-                    pos[sel] -= 1
-            elif key == "\x15":  # Ctrl+U
-                names[sel], pos[sel] = "", 0
-            elif isinstance(key, str) and len(key) == 1 and key.isprintable():
-                names[sel] = names[sel][:pos[sel]] + key + names[sel][pos[sel]:]
-                pos[sel] += 1
-    except KeyboardInterrupt:
-        return None
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old)
-        out.write("\r\x1b[J")
-        out.flush()
-
-
-def dump_selected(rows: list[Session]) -> bool:
-    """Dump sessions into the current directory; False if the prompt was backed out of."""
-    suffix = ".txt" if len(rows) == 1 else "_dump.txt"
-    names = rename_dump([f"{s.id}{suffix}" for s in rows])
-    if names is None:
-        return False
-    for s, name in zip(rows, names):
-        dump_session(s, Path(name.strip() or f"{s.id}{suffix}"))
-    return True
 
 
 CLAUDE_VIEW_LINES = 300  # a longer tool output shows this many lines; the rest is spilled to a file
@@ -1609,6 +1526,190 @@ def message_summary(message: dict) -> str:
         text = str(content or "")
     text = " ".join(text.split()) or "(empty)"
     return f"{role}: {text[:160]}{'…' if len(text) > 160 else ''}"
+
+
+def claude_message_hash(message: dict) -> str:
+    """Claude Code's hash for a request message (the api-request-blob key)."""
+    canonical = json.dumps(message, separators=(",", ":"), ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def claude_request_indexes(records: list[dict]) -> tuple[dict, dict, dict]:
+    """(blobs, shapes, requests) indexed by message hash, shape hash and request id."""
+    blobs: dict[str, dict] = {}
+    shapes: dict[str, dict] = {}
+    requests: dict[str, dict] = {}
+    for rec in records:
+        kind = rec.get("type")
+        if kind == "api-request-blob":
+            if isinstance(rec.get("hash"), str) and isinstance(rec.get("message"), dict):
+                blobs[rec["hash"]] = rec["message"]
+        elif kind == "api-request-shape":
+            if isinstance(rec.get("shapeHash"), str) and isinstance(rec.get("shape"), dict):
+                shapes[rec["shapeHash"]] = rec["shape"]
+        elif kind == "api-request":
+            if isinstance(rec.get("id"), str):
+                requests[rec["id"]] = rec
+    return blobs, shapes, requests
+
+
+def claude_rebuild_messages(records: list[dict], hashes: set[str]) -> dict[str, dict]:
+    """Messages whose bodies the blob log omitted, rebuilt from the ordinary
+    user/assistant records and checked against the requested hash.
+
+    Claude Code splits one API message across several records (a response's
+    thinking/text/tool_use blocks, a turn's tool results), and a user string
+    becomes a text block, so every contiguous same-role run is a candidate."""
+    pool = [
+        rec for rec in records
+        if isinstance(rec.get("message"), dict)
+        and rec["message"].get("role") in ("user", "assistant")
+        and rec["message"].get("content") is not None
+    ]
+    found: dict[str, dict] = {}
+    for i, rec in enumerate(pool):
+        role = rec["message"]["role"]
+        blocks: list = []
+        for other in pool[i:i + 64]:  # one API message can span many tool results
+            if other["message"].get("role") != role:
+                break
+            content = other["message"].get("content")
+            if isinstance(content, str):
+                blocks.append({"type": "text", "text": content})
+            elif isinstance(content, list):
+                blocks.extend(content)
+            else:
+                break
+            candidate = {"role": role, "content": list(blocks)}
+            message_hash = claude_message_hash(candidate)
+            if message_hash in hashes and message_hash not in found:
+                found[message_hash] = candidate
+            if len(found) == len(hashes):
+                return found
+    return found
+
+
+def parse_tool_schema(schema):
+    """A logged tool schema is a stringified dict; parse it back when possible."""
+    if not isinstance(schema, str):
+        return schema
+    for parse in (json.loads, ast.literal_eval):
+        try:
+            return parse(schema)
+        except (json.JSONDecodeError, ValueError, SyntaxError):
+            pass
+    return schema
+
+
+@dataclass
+class RequestBody:
+    """One reconstructed API request: everything that was sent to the model."""
+    params: dict
+    system: list[dict]
+    tools: list[dict]
+    messages: list[dict]
+    cache_control: list[dict]
+    missing: list[str]  # hashes whose body could not be recovered
+
+    def payload(self) -> dict:
+        """The Messages API body. `betas` is a request option, not a body field."""
+        body = {k: copy.deepcopy(v) for k, v in self.params.items() if k != "betas"}
+        if self.system:
+            body["system"] = copy.deepcopy(self.system)
+        if self.tools:
+            body["tools"] = copy.deepcopy(self.tools)
+        body["messages"] = copy.deepcopy(self.messages)
+        return body
+
+
+def claude_request_body(
+    records: list[dict],
+    request: dict,
+    blobs: dict[str, dict] | None = None,
+    shapes: dict[str, dict] | None = None,
+    requests: dict[str, dict] | None = None,
+) -> RequestBody:
+    """Reconstruct the complete body of one logged API request.
+
+    A request is logged as a delta: params, a shape (system/tools) and message
+    hashes in tail, with base pointing at the previous request. Walking that
+    chain and keeping the last `keep` carried messages yields every hash sent.
+    Bodies come from api-request-blob; the ones the log omitted are rebuilt from
+    ordinary user/assistant records and verified against their hash. cacheControl
+    paths are reattached to the blocks they mark."""
+    if blobs is None or shapes is None or requests is None:
+        blobs, shapes, requests = claude_request_indexes(records)
+
+    chain: list[dict] = []
+    seen: set[str] = set()
+    current: dict | None = request
+    while isinstance(current, dict):
+        request_id = current.get("id")
+        if isinstance(request_id, str):
+            if request_id in seen:
+                break
+            seen.add(request_id)
+        chain.append(current)
+        base = current.get("base")
+        current = requests.get(base) if isinstance(base, str) else None
+    chain.reverse()
+
+    base_hashes = [
+        h for req in chain[:-1] for h in (req.get("tail") or []) if isinstance(h, str)
+    ]
+    tail = [h for h in (request.get("tail") or []) if isinstance(h, str)]
+    keep = request.get("keep")
+    keep = keep if isinstance(keep, int) and keep >= 0 else len(base_hashes)
+    sent = (base_hashes[-keep:] if keep else []) + tail
+
+    missing_hashes = {h for h in sent if h not in blobs}
+    rebuilt = claude_rebuild_messages(records, missing_hashes) if missing_hashes else {}
+
+    messages = []
+    missing = []
+    for message_hash in sent:
+        message = blobs.get(message_hash) or rebuilt.get(message_hash)
+        if message is None:
+            missing.append(message_hash)
+            message = {
+                "role": "missing",
+                "content": [{"type": "text", "text": f"(message not found: {message_hash})"}],
+            }
+            messages.append(copy.deepcopy(message))
+            continue
+        message = copy.deepcopy(message)
+        if isinstance(message.get("content"), str):  # the hash uses the text-block form
+            message["content"] = [{"type": "text", "text": message["content"]}]
+        messages.append(message)
+
+    params = copy.deepcopy(request.get("params") or {})
+    shape_hash = request.get("shapeHash")
+    shape = shapes.get(shape_hash) if isinstance(shape_hash, str) else None
+    shape = shape if isinstance(shape, dict) else {}
+    system = copy.deepcopy(shape.get("system") or [])
+    tools = copy.deepcopy(shape.get("tools") or [])
+    for tool in tools:
+        if isinstance(tool, dict) and isinstance(tool.get("input_schema"), str):
+            tool["input_schema"] = parse_tool_schema(tool["input_schema"])
+
+    cache_control = copy.deepcopy(request.get("cacheControl") or [])
+    groups = {"system": system, "tools": tools, "messages": messages}
+    for entry in cache_control:
+        path = entry.get("path") if isinstance(entry, dict) else None
+        if not (isinstance(path, list) and path and path[0] in groups):
+            continue
+        target = groups[path[0]]
+        for key in path[1:]:
+            if isinstance(target, list) and isinstance(key, int) and 0 <= key < len(target):
+                target = target[key]
+            elif isinstance(target, dict) and key in target:
+                target = target[key]
+            else:
+                target = None
+                break
+        if isinstance(target, dict):
+            target["cache_control"] = copy.deepcopy(entry.get("value") or {})
+    return RequestBody(params, system, tools, messages, cache_control, missing)
 
 
 def render_request(view, rec, blobs, shapes, by_id) -> None:
@@ -2470,12 +2571,6 @@ def interactive_menu(cwd: Path | None) -> int:
         if isinstance(payload, Session):
             return resume_session(payload)
         targets = [rows[i] for i in sorted(payload)] or [focus]
-        if kind == "dump":
-            if not dump_selected(targets):  # backed out of the dump prompt
-                marks = payload  # back to the picker, selection kept
-                continue
-            marks = []
-            continue
         blocked = next((s for s in targets if not agent_of(s).removable), None)
         if blocked:
             print(f"Removing {blocked.agent} sessions is not supported yet.")
@@ -2507,7 +2602,7 @@ def interactive_menu(cwd: Path | None) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="List, search, remove, dump or resume "
+        description="List, search, remove or resume "
         + "/".join(a.name for a in AGENTS)
         + " sessions; with no arguments, open the interactive menu "
         "(-l lists them; -a covers every directory).",
