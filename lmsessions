@@ -24,6 +24,7 @@ import sys
 import tempfile
 import termios
 import tty
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -57,32 +58,40 @@ Hit = tuple[str, int, int]  # (snippet text, match start, match end within the s
 NORMAL_PARTS = (
     "user", "assistant", "system", "thinking", "tool", "note", "attachment",
     "api", "loop", "procedure",
-)
-RAW_PARTS = (
-    "user", "assistant", "system", "text", "thinking", "tool_use", "tool_result", "other",
+    "compaction",
 )
 NORMAL_LABELS = (
-    ("user", "user"),
-    ("assistant", "assistant"),
-    ("system", "system"),
-    ("thinking", "thinking"),
-    ("tool", "tool calls"),
-    ("note", "notes"),
-    ("attachment", "attachments"),
-    ("api", "API requests"),
-    ("loop", "loops"),
-    ("procedure", "procedures"),
+    ("user", "user (用户输入与上下文摘要)"),
+    ("assistant", "assistant (模型回复正文)"),
+    ("system", "system (API 请求中的系统提示词)"),
+    ("thinking", "thinking (模型思考或思考摘要)"),
+    ("tool", "tool calls (模型工具调用及工具返回结果)"),
+    ("note", "notes (压缩边界、错误、中断等运行日志)"),
+    ("attachment", "attachments (指令、文件等注入上下文)"),
+    ("api", "API requests (重建的模型请求、参数及正文)"),
+    ("loop", "loops (单次模型响应的分组折叠)"),
+    ("procedure", "procedures (一个用户回合内多次响应的分组折叠)"),
 )
-RAW_LABELS = (
-    ("user", "user messages"),
-    ("assistant", "assistant messages"),
-    ("system", "system messages"),
-    ("text", "text blocks"),
-    ("thinking", "thinking blocks"),
-    ("tool_use", "tool_use blocks"),
-    ("tool_result", "tool_result blocks"),
-    ("other", "other blocks"),
-)
+
+
+def normal_view_labels(agent: str) -> tuple[tuple[str, str], ...]:
+    """Only offer sections supported by the selected agent's normal renderer."""
+    if agent == "claude":
+        return NORMAL_LABELS
+    labels = dict(NORMAL_LABELS)
+    if agent == "codex":
+        keys = ("user", "assistant", "system", "thinking", "tool", "note", "loop", "procedure")
+        labels["user"] = "user (用户输入)"
+        labels["system"] = "context (system/developer 指令及注入的用户上下文)"
+        labels["thinking"] = "reasoning (推理摘要与已记录的原始思考)"
+        labels["note"] = "notes (错误、流错误与用户中断)"
+    else:  # OpenCode
+        keys = ("user", "assistant", "thinking", "tool", "compaction", "system", "loop", "procedure")
+        labels["user"] = "user (用户消息正文)"
+        labels["thinking"] = "reasoning (assistant 消息中的推理内容)"
+        labels["system"] = "system (会话中的系统消息)"
+        labels["compaction"] = "compaction (上下文压缩摘要及触发原因)"
+    return tuple((key, labels[key]) for key in keys)
 
 
 @dataclass
@@ -90,9 +99,7 @@ class ViewOptions:
     """Settings for the viewer, edited before vim opens."""
     max_messages: int = 6  # -1 = every API request message, 0 = none
     normal_parts: tuple[str, ...] = NORMAL_PARTS
-    raw_parts: tuple[str, ...] = RAW_PARTS
     raw: bool = False
-    accumulative: bool = False
 
 
 def file_size(path: Path) -> int:
@@ -379,7 +386,7 @@ class CodexAgent(Agent):
         exec_agent(s, ["codex", "resume", s.id])
 
     def view(self, s: Session, view: "ViewBuilder", tmpdir: Path, options: ViewOptions) -> None:
-        codex_view(s, view, tmpdir)
+        codex_view(s, view, tmpdir, options)
 
     def transcript(self, s: Session) -> list[Turn]:
         if not s.path.is_file():
@@ -472,7 +479,7 @@ class OpenCodeAgent(Agent):
         exec_agent(s, ["opencode", "--session", s.id])
 
     def view(self, s: Session, view: "ViewBuilder", tmpdir: Path, options: ViewOptions) -> None:
-        opencode_view(self, s, view, tmpdir)
+        opencode_view(self, s, view, tmpdir, options)
 
     def messages(self, s: Session) -> list[tuple[str, dict]]:
         """The session's (type, data) messages in seq order; empty when the db is unavailable."""
@@ -1328,36 +1335,30 @@ def ask_enter(prompt: str) -> bool:
         out.flush()
 
 
-def edit_view_options(options: ViewOptions) -> ViewOptions | None:
+def edit_view_options(options: ViewOptions, agent: str = "claude") -> ViewOptions | None:
     """Menu shown by v; Enter returns the options (the caller opens vim), Esc backs out.
 
-    Every checkbox toggles with Space, including the mode and accumulative rows;
-    the API body size uses Left/Right."""
+    Space toggles checkboxes; type the API body size directly on its row."""
     opts = ViewOptions(
-        options.max_messages, tuple(options.normal_parts), tuple(options.raw_parts),
-        options.raw, options.accumulative,
+        options.max_messages, tuple(options.normal_parts), options.raw,
     )
+    number = str(opts.max_messages)
+    editing_number = False
+    labels = normal_view_labels(agent)
 
     def rows() -> list[tuple[str, str, str]]:
         out = [("raw", f"[{'x' if opts.raw else ' '}] raw mode", "check")]
-        if opts.raw:
-            out.append(
-                ("accum", f"[{'x' if opts.accumulative else ' '}] accumulative", "check")
-            )
-            selected = opts.raw_parts
-            labels = RAW_LABELS
-        else:
-            out.append(
-                (
-                    "limit",
-                    f"API body messages: {opts.max_messages}  (-1 = all, 0 = none)",
-                    "number",
+        if not opts.raw:
+            if agent == "claude":
+                out.append(
+                    (
+                        "limit",
+                        f"API body messages: {number}  (-1 = all, 0 = none; 直接输入数字)",
+                        "number",
+                    )
                 )
-            )
-            selected = opts.normal_parts
-            labels = NORMAL_LABELS
-        for key, label in labels:
-            out.append((key, f"[{'x' if key in selected else ' '}] {label}", "check"))
+            for key, label in labels:
+                out.append((key, f"[{'x' if key in opts.normal_parts else ' '}] {label}", "check"))
         return out
 
     sel = 0
@@ -1369,12 +1370,15 @@ def edit_view_options(options: ViewOptions) -> ViewOptions | None:
         while True:
             items = rows()
             sel = min(sel, len(items) - 1)
-            lines = ["View options (Enter open vim, Esc back):"]
+            lines = [f"View options · {agent} (Enter open vim, Esc back):"]
             for i, (_, text, _) in enumerate(items):
                 prefix = "> " if i == sel else "  "
                 text = f"\x1b[7m{text}\x1b[27m" if i == sel else text
                 lines.append(prefix + text)
-            lines.append("Space: toggle   Left/Right: size")
+            if opts.raw:
+                lines.append("仅模型输入原始文本及其 meta；每条消息显示一次。")
+            lines.append("Space: toggle" + ("   数量行: 数字/-/Backspace (-1 或非负整数)"
+                                            if agent == "claude" and not opts.raw else ""))
             height = len(lines)
             out.write(
                 "\x1b[J" + "".join(f"\r\x1b[K{line}\n" for line in lines)
@@ -1382,10 +1386,27 @@ def edit_view_options(options: ViewOptions) -> ViewOptions | None:
             )
             out.flush()
             key = read_key(fd)
-            if key in ("\r", "\n"):
-                return opts
             if key in ("esc", "\x0f"):  # Ctrl+O
                 return None
+            name, _, kind = items[sel]
+            if kind == "number":
+                if key in tuple("0123456789-") or key in ("\x7f", "\b", "\x15"):
+                    if key in ("\x7f", "\b"):
+                        number = number[:-1]
+                    elif key == "\x15":
+                        number = ""
+                    else:
+                        number = (number if editing_number else "") + key
+                    editing_number = True
+                    continue
+                if key in ("\r", "\n", "up", "k", "down", "j"):
+                    if not re.fullmatch(r"-1|[0-9]+", number):
+                        continue
+                    opts.max_messages = int(number)
+                    number = str(opts.max_messages)
+                    editing_number = False
+            if key in ("\r", "\n"):
+                return opts
             if key in ("up", "k"):
                 sel = (sel - 1) % len(items)
                 continue
@@ -1394,31 +1415,18 @@ def edit_view_options(options: ViewOptions) -> ViewOptions | None:
                 continue
             if key not in ("left", "h", "right", "l", " "):
                 continue
-            name, _, kind = items[sel]
             step = -1 if key in ("left", "h") else 1 if key in ("right", "l") else 0
-            if kind == "number":
-                if step:
-                    opts.max_messages = max(-1, min(999, opts.max_messages + step))
-            elif name == "raw":
+            if name == "raw":
                 if key == " " or step:
                     opts.raw = not opts.raw
                     sel = 0
-            elif name == "accum":
-                if key == " " or step:
-                    opts.accumulative = not opts.accumulative
-            elif key == " ":
-                labels = RAW_LABELS if opts.raw else NORMAL_LABELS
-                current = opts.raw_parts if opts.raw else opts.normal_parts
-                picked = [k for k, _ in labels if k in current]
+            elif key == " " and kind == "check":
+                picked = list(opts.normal_parts)
                 if name in picked:
                     picked.remove(name)
                 else:
                     picked.append(name)
-                picked = tuple(k for k, _ in labels if k in picked)
-                if opts.raw:
-                    opts.raw_parts = picked
-                else:
-                    opts.normal_parts = picked
+                opts.normal_parts = tuple(k for k in NORMAL_PARTS if k in picked)
     except KeyboardInterrupt:
         return None
     finally:
@@ -1444,14 +1452,75 @@ class ViewBuilder:
         self.lines: list[str] = []
         self.folds: list[tuple[int, int]] = []
         self.spills = 0
+        self.counts: tuple[int, int] | None = None
+        self.count_width = 1
 
-    def section(self, header: str, body: list[str]) -> None:
+    def abstract(self, header: str) -> str:
+        """Align counters, time, index, kind and the start of summary text."""
+        ts = ""
+        match = re.match(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s*", header)
+        if match:
+            ts, header = match.group(1), header[match.end():]
+        header = header.strip()
+        index = ""
+        match = re.match(r"^(\[\d+\])\+?\s*", header)
+        if match:
+            index, header = match.group(1), header[match.end():]
+        tag = ""
+        if header.startswith("[subagent] "):
+            tag, header = "[subagent] ", header[len("[subagent] "):]
+        if header.startswith("✗ "):
+            tag += "✗ "
+            header = header[2:]
+        match = re.match(
+            r"^(CONTEXT SUMMARY|PROCEDURE|DEVELOPER|ASSISTANT|THINKING|ATTACHMENT|"
+            r"SYSTEM|USER|TOOL|LOOP|API|MODEL INPUT|RESULT)\b[: ]*", header, re.I,
+        )
+        kind = match.group(1).upper() if match else "NOTE"
+        text = header[match.end():] if match else header
+        if kind == "RESULT":
+            kind = "TOOL"
+            text = "result " + text
+        user, total = self.counts if self.counts is not None else ("-", "-")
+        return view_meta(
+            f"用户累加 {user:>{self.count_width}}  所有累加 {total:>{self.count_width}} │ "
+            f"{ts:19} │ {index:8} {kind:16} │ {tag}{text}"
+        )
+
+    def section(self, header: str, body: "list[str] | ViewBuilder") -> None:
         start = len(self.lines) + 1
-        self.lines.append(header)
+        self.lines.append(self.abstract(header))
+        if isinstance(body, ViewBuilder):
+            offset = len(self.lines)
+            self.folds.extend((a + offset, b + offset) for a, b in body.folds)
+            body = body.lines
         self.lines.extend(body)
         if body:
             self.folds.append((start, len(self.lines)))
         self.lines.append("")
+
+
+def view_meta(text: str) -> str:
+    """Mark viewer annotations without modifying conversation/request content."""
+    return f"⟦meta⟧ {text}"
+
+
+class Accumulation:
+    """Observed context additions: initial user send is zero in both columns."""
+
+    def __init__(self):
+        self.user = -1
+        self.total = -1
+
+    @property
+    def counts(self) -> tuple[int, int]:
+        return max(0, self.user), max(0, self.total)
+
+    def advance(self, user: bool = False) -> tuple[int, int]:
+        if user:
+            self.user += 1
+        self.total += 1
+        return self.counts
 
 
 def record_ts(rec: dict) -> str:
@@ -1551,7 +1620,7 @@ def tool_text(rec: dict, block: dict) -> str:
 def input_lines(inp) -> list[str]:
     """A tool_use input as readable key/value lines, keeping multi-line strings multi-line."""
     if not isinstance(inp, dict) or not inp:
-        return ["(none)"]
+        return [view_meta("(none)")]
     out = []
     for key, value in inp.items():
         if isinstance(value, str) and "\n" in value:
@@ -1566,11 +1635,11 @@ def spill_lines(view: ViewBuilder, text: str, tmpdir: Path) -> list[str]:
     """The first CLAUDE_VIEW_LINES lines; a longer text is written whole to a file for gf."""
     lines = text.splitlines()
     if len(lines) <= CLAUDE_VIEW_LINES:
-        return lines or ["(no output)"]
+        return lines or [view_meta("(no output)")]
     view.spills += 1
     path = tmpdir / f"output-{view.spills:03d}.txt"
     path.write_text(text.rstrip("\n") + "\n", encoding="utf-8")
-    return lines[:CLAUDE_VIEW_LINES] + [f"full output ({len(lines)} lines): {path}"]
+    return lines[:CLAUDE_VIEW_LINES] + [view_meta(f"full output ({len(lines)} lines): {path}")]
 
 
 def message_section(view, ts: str, tag: str, label: str, text: str) -> None:
@@ -1579,19 +1648,28 @@ def message_section(view, ts: str, tag: str, label: str, text: str) -> None:
 
 
 def tool_section(view, ts: str, tag: str, name: str, inp: dict, output: str | None,
-                 tmpdir: Path, failed: bool = False, denied: str | None = None) -> None:
+                 tmpdir: Path, failed: bool = False, denied: str | None = None,
+                 local_output: bool = False, output_counts=None) -> None:
     """A tool call fold: its input, then the result (None when no result was logged)."""
     mark = "✗ " if failed or denied else ""
-    header = f"{ts} {tag}{mark}{tool_marker(name, inp).strip()}"
-    body = ["input:"]
+    header = f"{ts} {tag}{mark}ASSISTANT tool call: {tool_marker(name, inp).strip()}"
+    body = [view_meta("input (assistant):")]
     body.extend(input_lines(inp))
     if output is None:
-        body.append("(no result)")
+        body.append(view_meta("(no result)"))
     else:
         if denied:
-            body.append(f"denied: {denied}")
-        body.append("result:")
-        body.extend(spill_lines(view, output, tmpdir))
+            body.append(view_meta(f"denied: {denied}"))
+        result = spill_lines(view, output, tmpdir)
+        if local_output:
+            result = [f"⟦local⟧ {line}" for line in result]
+        content = ViewBuilder()
+        content.count_width = view.count_width
+        content.counts = output_counts if output_counts is not None else view.counts
+        content.lines = body
+        content.section("result (local toolUseResult; model-visible text may differ):"
+                        if local_output else "result (tool):", result)
+        body = content
     view.section(header, body)
 
 
@@ -1599,18 +1677,23 @@ def view_header(view, s: Session) -> None:
     title = " ".join((s.title or "").split()) or s.id
     view.lines.extend(
         [
-            title,
-            f"{s.agent} · {s.id} · {s.cwd}",
-            "fold: za/zo/zc or click the fold column · full output: gf on its path",
+            view_meta(title),
+            view_meta(f"{s.agent} · {s.id} · {s.cwd}"),
+            view_meta("fold: za/zo/zc or click the fold column · full output: gf on its path"),
+            view_meta("⟦meta⟧ = viewer/log metadata; ⟦local⟧ = local tool detail, not the request body"),
+            view_meta("request roles are API roles: user may include tool results/injected context"),
             "",
         ]
     )
 
 
 def add_thinking(view, entry) -> None:
+    body = entry["text"].splitlines() or [view_meta("(no text)")]
+    if entry.get("metadata"):
+        body = [view_meta(line) for line in entry["text"].splitlines()]
     view.section(
-        f"{entry['ts']} {entry.get('tag', '')}{entry['label']}",
-        entry["text"].splitlines() or ["(no text)"],
+        f"{entry['ts']} {entry.get('tag', '')}ASSISTANT {entry['label']}",
+        body,
     )
 
 
@@ -1655,25 +1738,106 @@ def message_lines(index: int, message: dict, marker: str = "", parts=None) -> li
             elif kind == "text":
                 body.extend((block.get("text") or "").splitlines() or [""])
             elif kind == "thinking":
-                body.append("THINKING:")
+                body.append(view_meta("THINKING (assistant):"))
                 body.extend((block.get("thinking") or block.get("text") or "").splitlines())
             elif kind == "tool_use":
-                body.append(f"TOOL_USE {block.get('name') or '?'}:")
+                body.append(view_meta(f"TOOL_USE {block.get('name') or '?'} (assistant):"))
                 body.extend(
                     json.dumps(block.get("input") or {}, ensure_ascii=False, indent=2).splitlines()
                 )
             elif kind == "tool_result":
-                body.append("TOOL_RESULT" + (" (error)" if block.get("is_error") else "") + ":")
+                body.append(view_meta(
+                    f"TOOL_RESULT (tool, tool_use_id={block.get('tool_use_id') or '?'})"
+                    + (" (error)" if block.get("is_error") else "") + ":"
+                ))
                 body.extend(text_of(block.get("content")).splitlines() or [""])
             else:
-                body.append(f"[{block.get('type') or 'block'}]")
+                body.append(view_meta(f"[{block.get('type') or 'block'}]"))
                 body.extend(json.dumps(block, ensure_ascii=False, indent=2).splitlines())
     elif parts is None or "other" in parts:
         body.extend(str(content or "").splitlines() or [""])
     if parts is not None and content not in (None, "", []) and not body:
         return []  # every part of this message was deselected
     label = "" if index is None else f"[{index}]"  # None: the request's system prompt
-    return [f"{label}{marker} {role}".strip()] + body
+    if role == "missing":
+        body = [view_meta(line) for line in body]
+    return [view_meta(f"{label}{marker} {role}".strip())] + body
+
+
+def request_message_section(view, index, message, marker="") -> None:
+    """Give every request message an independently foldable, counted abstract."""
+    lines = message_lines(index, message, marker)
+    label = lines[0].removeprefix("⟦meta⟧ ")
+    view.section(f"{label}: {text_preview(chr(10).join(lines[1:]))}", lines[1:])
+
+
+@dataclass
+class ModelInput:
+    """One logged model-input text, plus display-only provenance."""
+    role: str
+    lines: list[str]
+    timestamp: str
+    counts: tuple[int, int]
+    source: str
+
+
+def input_content_lines(content) -> list[str]:
+    """Preserve input text; non-text payloads get metadata, never a log dump."""
+    if isinstance(content, str):
+        return content.splitlines()
+    if not isinstance(content, list):
+        return []
+    lines = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        kind = block.get("type")
+        if kind in ("text", "input_text", "output_text"):
+            text = block.get("text")
+            if isinstance(text, str):
+                lines.extend(text.splitlines())
+        elif kind == "thinking":
+            text = block.get("thinking")
+            if isinstance(text, str):
+                lines.append(view_meta("thinking (assistant context)"))
+                lines.extend(text.splitlines())
+        elif kind == "tool_use":
+            lines.append(view_meta(f"tool_use {block.get('name') or '?'} id={block.get('id') or '?'}"))
+            lines.extend(json.dumps(block.get("input") or {}, ensure_ascii=False, indent=2).splitlines())
+        elif kind == "tool_result":
+            lines.append(view_meta(f"tool_result id={block.get('tool_use_id') or '?'}"))
+            lines.extend(input_content_lines(block.get("content")))
+        # Images, signatures, encrypted reasoning and unknown blocks are not text.
+    return lines
+
+
+def render_model_inputs(view, inputs, missing_only=False, parts=None) -> None:
+    """The same projection powers raw and fills any gaps in the normal view."""
+    normal_text = "\n".join(line for line in view.lines if not line.startswith("⟦meta⟧ ")) if missing_only else ""
+    content = ViewBuilder()
+    content.count_width = view.count_width
+    for index, message in enumerate(inputs):
+        category = {"developer": "system", "system": "system", "tool": "tool"}.get(message.role, message.role)
+        if parts is not None and category not in parts:
+            continue
+        # Normal mode can hide categories or abbreviate API bodies, but its
+        # complete projection must still contain every text available in raw.
+        text_lines = [line for line in message.lines if not line.startswith("⟦meta⟧ ")]
+        text = "\n".join(text_lines)
+        if not message.lines:
+            continue
+        content.counts = message.counts
+        preview = text_preview(text)
+        body = message.lines
+        if missing_only and text and text in normal_text:
+            body = [view_meta("正文已在上方展示；此处保留编号、来源及累计信息。")]
+        content.section(f"{message.timestamp} [{index}] {message.role}: {preview}",
+                        [view_meta(message.source)] + body)
+    if content.lines:
+        view.counts = None
+        view.section("MODEL INPUT: 原始输入正文（每条消息一次；累计次数仅在 meta 中）", content)
+    elif not missing_only:
+        view.section("MODEL INPUT", [view_meta("(no recoverable sent text)")])
 
 
 def claude_message_hash(message: dict) -> str:
@@ -1881,20 +2045,20 @@ def render_request(view, rec, records, blobs, shapes, by_id, rebuilt, options) -
     params = body.params
     base = rec.get("base")
     base = base if isinstance(base, str) else None
-    lines = ["params:"]
-    lines.extend(json.dumps(params, ensure_ascii=False, indent=2).splitlines())
+    lines = [view_meta("params (API configuration):")]
+    lines.extend(view_meta(line) for line in json.dumps(params, ensure_ascii=False, indent=2).splitlines())
     shape_hash = rec.get("shapeHash")
-    lines.append(
+    lines.append(view_meta(
         f"shape {(shape_hash or '')[:8]}: system={len(body.system)} tool(s)={len(body.tools)}"
-    )
+    ))
     system_text = "\n".join(
         block.get("text", "") for block in body.system if isinstance(block, dict)
     )
     if body.tools:
         names = [tool.get("name") or "?" for tool in body.tools if isinstance(tool, dict)]
-        lines.append("tools: " + ", ".join(names))
+        lines.append(view_meta("tools: " + ", ".join(names)))
     if body.missing:
-        lines.append(f"missing bodies: {len(body.missing)}")
+        lines.append(view_meta(f"missing bodies: {len(body.missing)}"))
     selected = [
         (i, message) for i, message in enumerate(body.messages)
         if message.get("role") in options.normal_parts or message.get("role") == "missing"
@@ -1907,14 +2071,18 @@ def render_request(view, rec, records, blobs, shapes, by_id, rebuilt, options) -
     entries.extend(selected)
     limit = options.max_messages
     if limit == 0 or not entries:
-        lines.append("content: (none)")
+        lines.append(view_meta("content: (none shown)"))
     else:
         shown = entries if limit < 0 else entries[-limit:]
-        lines.append(f"content ({len(entries)} messages):")
+        lines.append(view_meta(f"content ({len(entries)} messages):"))
         if len(shown) < len(entries):
-            lines.append("......")
+            lines.append(view_meta("......"))
+        content = ViewBuilder()
+        content.counts, content.count_width = view.counts, view.count_width
+        content.lines = lines
         for index, message in shown:
-            lines.extend(message_lines(index, message))
+            request_message_section(content, index, message)
+        lines = content
     base_label = f" base={(base or '')[:8]}" if base else ""
     view.section(
         f"{record_ts(rec)} API request model={params.get('model', '?')}"
@@ -1938,20 +2106,26 @@ class TurnBuilder:
     def __init__(self):
         self.turn = new_turn()
         self.loop: dict | None = None
+        self.counts: tuple[int, int] | None = None
 
     def add_item(self, item: dict) -> None:
+        item["counts"] = self.counts
         if self.loop is not None:
             self.loop["items"].append(item)
         else:
             self.turn["pre"].append(item)
 
-    def add_note(self, header: str, body: list[str], category: str = "note") -> None:
+    def add_note(self, header: str, body: list[str], category: str = "note",
+                 metadata: bool = True) -> None:
         self.add_item(
-            {"kind": "note", "category": category, "header": header, "body": body}
+            {"kind": "note", "category": category, "header": header,
+             "body": body, "metadata": metadata}
         )
 
-    def add_thinking(self, ts: str, tag: str, label: str, text: str) -> None:
-        item = {"kind": "thinking", "ts": ts, "tag": tag, "label": label, "text": text}
+    def add_thinking(self, ts: str, tag: str, label: str, text: str,
+                     metadata: bool = False) -> None:
+        item = {"kind": "thinking", "ts": ts, "tag": tag, "label": label,
+                "text": text, "metadata": metadata}
         self.add_item(item)
 
     def add_text(self, ts: str, tag: str, text: str) -> None:
@@ -1960,7 +2134,8 @@ class TurnBuilder:
         self.turn["last_text"] = item
 
     def add_call(self, ts: str, tag: str, name: str, inp: dict, output: str | None,
-                 failed: bool = False, denied: str | None = None) -> None:
+                 failed: bool = False, denied: str | None = None,
+                 local_output: bool = False, output_counts=None) -> None:
         item = {
             "kind": "call",
             "ts": ts,
@@ -1970,18 +2145,21 @@ class TurnBuilder:
             "output": output,
             "failed": failed,
             "denied": denied,
+            "local_output": local_output,
+            "output_counts": output_counts,
         }
         self.add_item(item)
 
     def start_loop(self, ts: str = "", request: dict | None = None) -> None:
         if self.loop is None or self.loop["items"]:
-            self.loop = {"requests": [], "items": [], "ts": ts}
+            self.loop = {"requests": [], "items": [], "ts": ts, "counts": self.counts}
             self.turn["loops"].append(self.loop)
         if request is not None:
             self.loop["requests"].append(request)
 
     def set_user(self, ts: str, tag: str, label: str, text: str) -> None:
-        self.turn["user"] = {"ts": ts, "tag": tag, "label": label, "text": text}
+        self.turn["user"] = {"ts": ts, "tag": tag, "label": label, "text": text,
+                             "counts": self.counts}
 
     def reset(self) -> None:
         self.turn = new_turn()
@@ -2019,6 +2197,7 @@ def render_item(view, item, tmpdir, final, parts=None) -> None:
     """Render one loop item; the final assistant text is left for render_turn."""
     if item is final:
         return
+    view.counts = item.get("counts")
     kind = item["kind"]
     if parts is not None:
         if kind == "thinking" and "thinking" not in parts:
@@ -2034,12 +2213,15 @@ def render_item(view, item, tmpdir, final, parts=None) -> None:
     elif kind == "call":
         tool_section(
             view, item["ts"], item["tag"], item["name"], item["input"], item["output"],
-            tmpdir, item["failed"], item["denied"],
+            tmpdir, item["failed"], item["denied"], item["local_output"], item["output_counts"],
         )
     elif kind == "text":
         message_section(view, item["ts"], item["tag"], "ASSISTANT", item["text"])
     else:  # note
-        view.section(item["header"], item["body"])
+        body = item["body"]
+        if item["metadata"]:
+            body = [view_meta(line) for line in body]
+        view.section(item["header"], body)
 
 
 def render_loop(view, loop, tmpdir, final, draw_request=None, parts=None) -> None:
@@ -2060,8 +2242,9 @@ def render_loop(view, loop, tmpdir, final, draw_request=None, parts=None) -> Non
     if texts and not parts_list:
         parts_list.append(f"{texts} assistant text{'s' if texts != 1 else ''}")
     start = len(view.lines) + 1
+    view.counts = loop.get("counts")
     if show_loop:
-        view.lines.append(f"{loop['ts']} LOOP: " + (" · ".join(parts_list) or "items"))
+        view.lines.append(view.abstract(f"{loop['ts']} LOOP: " + (" · ".join(parts_list) or "items")))
     if draw_request is not None and (parts is None or "api" in parts):
         for rec in requests:
             draw_request(view, rec)
@@ -2095,14 +2278,16 @@ def render_turn(view, turn, tmpdir, draw_request=None, parts=None) -> None:
     ]
     user = turn["user"]
     if user is not None and (parts is None or "user" in parts):
+        view.counts = user.get("counts")
         message_section(view, user["ts"], user["tag"], user["label"], user["text"])
     pre = turn["pre"]
     procedure = parts is None or "procedure" in parts
     if procedure and (len(loops) > 1 or (loops and pre)):
         start = len(view.lines) + 1
         count = len(loops)
+        view.counts = loops[0].get("counts")
         view.lines.extend(
-            [f"{loops[0]['ts']} PROCEDURE ({count} loop{'s' if count != 1 else ''})", ""]
+            [view.abstract(f"{loops[0]['ts']} PROCEDURE ({count} loop{'s' if count != 1 else ''})"), ""]
         )
         for item in pre:
             render_item(view, item, tmpdir, final, parts)
@@ -2188,41 +2373,91 @@ def claude_active_requests(records: list[dict], active: set[str] | None) -> set[
     return live
 
 
-def render_raw_view(
-    view, records, live, blobs, shapes, requests_by_id, rebuilt, options: ViewOptions
-) -> None:
-    """Only the reconstructed API request messages, as sent to the model.
+def claude_accumulations(records, live, blobs, shapes, requests_by_id, rebuilt,
+                         tool_counts=None) -> dict[int, tuple[int, int]]:
+    """Count context extensions, rather than retries of an identical body.
 
-    Accumulative shows every request's whole prefix, marking the messages added
-    since the previous request; otherwise only the latest request is shown."""
-    if not live:
-        view.section("API request bodies", ["(no API requests)"])
-        return
-    if not options.accumulative:
-        live = live[-1:]
-    previous: set[str] = set()
+    API user roles also carry tools/injections; match text against real logged
+    prompts to identify user additions. Blob-only logs fall back to text users.
+    Hashes already seen stay old across compaction/cache-control changes."""
+    prompts = {
+        ClaudeAgent.user_text(rec.get("message") or {})
+        for rec in records if rec.get("type") == "user"
+        and not rec.get("isMeta") and not rec.get("isCompactSummary")
+        and not rec.get("isSidechain")
+    }
+    prompts = {text for text in prompts if text and not text.startswith(
+        ("<local-command", "<command-name", "<command-message")
+    )}
+    counter = Accumulation()
+    seen: Counter = Counter()
+    logged_users = any(rec.get("type") == "user" for rec in records)
+    result = {}
     for rec in live:
         sent = claude_sent_hashes(rec, requests_by_id)
+        occurrences: Counter = Counter()
+        new = set()
+        for index, message_hash in enumerate(sent):
+            occurrences[message_hash] += 1
+            if occurrences[message_hash] > seen[message_hash]:
+                new.add(index)
+        if new or not result:
+            body = claude_request_body(records, rec, blobs, shapes, requests_by_id, rebuilt)
+            user = False
+            for index, message in enumerate(body.messages):
+                if index not in new or message.get("role") != "user":
+                    continue
+                text = ClaudeAgent.user_text(message)
+                if text and (text in prompts if logged_users else not any(
+                    block.get("type") == "tool_result"
+                    for block in message.get("content") or [] if isinstance(block, dict)
+                )):
+                    user = True
+            counter.advance(user=user)
+            if tool_counts is not None:
+                for index, message in enumerate(body.messages):
+                    if index not in new:
+                        continue
+                    for block in message.get("content") or []:
+                        if isinstance(block, dict) and block.get("type") == "tool_result":
+                            tool_counts.setdefault(block.get("tool_use_id"), counter.counts)
+        result[id(rec)] = counter.counts
+        seen |= occurrences
+    return result
+
+
+def claude_model_inputs(records, live, blobs, shapes, requests_by_id, rebuilt, counts):
+    """Union of messages actually present in requests; each occurrence once.
+
+    Identical *separate* user prompts remain separate occurrences. Resending a
+    growing prefix only updates metadata on its existing entries.
+    """
+    inputs = []
+    seen = {}
+    for request_index, rec in enumerate(live):
+        sent = claude_sent_hashes(rec, requests_by_id)
         body = claude_request_body(records, rec, blobs, shapes, requests_by_id, rebuilt)
-        new = set(sent) - previous if options.accumulative else set()
-        header = (
-            f"{record_ts(rec)} API request body ({len(body.messages)} messages"
-            + (f", +{len(new)} new" if options.accumulative else "")
-            + ")"
-        )
-        lines = []
-        if body.missing:
-            lines.append(f"missing bodies: {len(body.missing)}")
-        parts = set(options.raw_parts)
-        for index, (message_hash, message) in enumerate(zip(sent, body.messages)):
-            role = message.get("role") or "?"
-            if role != "missing" and role not in parts:
+        entries = []
+        if body.system:
+            lines = input_content_lines(body.system)
+            entries.append((("system", tuple(lines)), "system", lines))
+        occurrences: Counter = Counter()
+        for message_hash, message in zip(sent, body.messages):
+            occurrences[message_hash] += 1
+            if message.get("role") == "missing":
+                continue  # An unrecovered body is not original model-input text.
+            key = (message_hash, occurrences[message_hash])
+            entries.append((key, message.get("role") or "?", input_content_lines(message.get("content"))))
+        for key, role, lines in entries:
+            if not lines:
                 continue
-            lines.extend(
-                message_lines(index, message, "+" if message_hash in new else "", parts)
-            )
-        view.section(header, lines or ["(empty)"])
-        previous = set(sent)
+            if key not in seen:
+                seen[key] = ModelInput(role, lines, record_ts(rec), counts[id(rec)], "")
+                inputs.append(seen[key])
+            entry = seen[key]
+            entry.counts = counts[id(rec)]
+            entry.source = f"API input; latest request [{request_index}] id={rec.get('id') or '?'}"
+    return inputs
 
 
 def claude_view(s: Session, view: "ViewBuilder", tmpdir: Path, options: ViewOptions) -> None:
@@ -2278,15 +2513,31 @@ def claude_view(s: Session, view: "ViewBuilder", tmpdir: Path, options: ViewOpti
     }
     rebuilt = claude_rebuild_messages(records, all_missing) if all_missing else {}
 
+    tool_counts = {}
+    counts = claude_accumulations(records, live_records, blobs, shapes, requests_by_id, rebuilt, tool_counts)
+    view.count_width = len(str(max((max(pair) for pair in counts.values()), default=len(records))))
+    next_counts = {}
+    upcoming = None
+    for rec in reversed(records):
+        if id(rec) in counts:
+            upcoming = counts[id(rec)]
+        next_counts[id(rec)] = upcoming
+
     view_header(view, s)
+    view.lines.extend([
+        view_meta("用户累加 = 用户追加轮次；所有累加 = 含工具结果自动续发的追加轮次；初次均为 0"),
+        "",
+    ])
+    inputs = claude_model_inputs(records, live_records, blobs, shapes, requests_by_id, rebuilt, counts)
     if options.raw:
-        render_raw_view(
-            view, records, live_records, blobs, shapes, requests_by_id, rebuilt, options
-        )
+        render_model_inputs(view, inputs)
         return
     builder = TurnBuilder()
+    fallback = Accumulation()
+    pending_result = False
 
     def draw_request(v, rec: dict) -> None:
+        v.counts = counts[id(rec)]
         render_request(v, rec, records, blobs, shapes, requests_by_id, rebuilt, options)
 
     def add_call_item(block: dict, ts: str, tag: str) -> None:
@@ -2300,6 +2551,8 @@ def claude_view(s: Session, view: "ViewBuilder", tmpdir: Path, options: ViewOpti
             tool_text(rec, result) if result is not None else None,
             bool(result and result.get("is_error")),
             rec.get("toolDenialKind") if rec else None,
+            rec is not None and rec.get("toolUseResult") is not None,
+            tool_counts.get(block.get("id")),
         )
 
     def flush_turn() -> None:
@@ -2310,6 +2563,7 @@ def claude_view(s: Session, view: "ViewBuilder", tmpdir: Path, options: ViewOpti
         kind = rec.get("type")
         if kind == "api-request":
             if i in live_requests:
+                builder.counts = counts[id(rec)]
                 builder.start_loop(record_ts(rec), rec)
             continue
         if rewound(rec):
@@ -2334,15 +2588,24 @@ def claude_view(s: Session, view: "ViewBuilder", tmpdir: Path, options: ViewOpti
                         # The request for this user turn is logged just before it.
                         carried = builder.turn["loops"].pop()
                 flush_turn()
+                builder.counts = (counts[id(carried["requests"][-1])] if carried is not None
+                                  else next_counts[id(rec)]) or fallback.advance(
+                                      user=not rec.get("isCompactSummary")
+                                  )
                 label = "CONTEXT SUMMARY" if rec.get("isCompactSummary") else "USER"
                 builder.set_user(ts, tag, label, text)
                 if carried is not None:
                     for request in list(carried["requests"]):
                         builder.start_loop(record_ts(request), request)
+            if not live_records and any(block.get("type") == "tool_result" for block in content_blocks(rec)):
+                pending_result = True
             if rec.get("interruptedMessageId"):
                 builder.add_note(f"{ts} {tag}user interrupted", [])
             continue
         if kind == "assistant":
+            if not live_records and pending_result:
+                builder.counts = fallback.advance()
+                pending_result = False
             msg = rec.get("message")
             msg = msg if isinstance(msg, dict) else {}
             blocks = content_blocks(rec)
@@ -2361,15 +2624,17 @@ def claude_view(s: Session, view: "ViewBuilder", tmpdir: Path, options: ViewOpti
                     label = "thinking"
                     if rec.get("thinkingDisplay") == "summarized":
                         label += " (summarized)"
-                    builder.add_thinking(ts, tag, label, text)
+                    builder.add_thinking(ts, tag, label, text,
+                                         metadata=rec.get("thinkingDisplay") == "summarized")
                 elif typ == "tool_use":
                     add_call_item(block, ts, tag)
                 elif typ == "image":
-                    builder.add_note(f"{ts} {tag}image", ["[image]"])
+                    builder.add_note(f"{ts} {tag}ASSISTANT image", [view_meta("[image]")], metadata=False)
                 else:
                     builder.add_note(
-                        f"{ts} {tag}{typ or 'block'}",
+                        f"{ts} {tag}ASSISTANT {typ or 'block'}",
                         [json.dumps(block, ensure_ascii=False)],
+                        metadata=False,
                     )
             if not blocks:
                 text = ClaudeAgent.user_text(msg).strip()
@@ -2420,9 +2685,11 @@ def claude_view(s: Session, view: "ViewBuilder", tmpdir: Path, options: ViewOpti
                     f"{ts} {tag}attachment: {attachment.get('type')}",
                     text.splitlines(),
                     category="attachment",
+                    metadata=False,
                 )
             continue
     flush_turn()
+    render_model_inputs(view, inputs, missing_only=True, parts=set(options.normal_parts))
 
 
 def parse_arguments(raw) -> dict:
@@ -2447,7 +2714,132 @@ def codex_reasoning(payload: dict) -> str:
     return "\n\n".join(parts)
 
 
-def codex_view(s: Session, view: "ViewBuilder", tmpdir: Path) -> None:
+def codex_accumulations(records) -> dict[int, tuple[int, int]]:
+    """Infer sends from real prompts and batches of tool results, ignoring event copies."""
+    modern = any(CodexAgent.modern_prompt(rec) for rec in records)
+    counter = Accumulation()
+    in_results = False
+    counts = {}
+    for rec in records:
+        payload = rec.get("payload") or {}
+        kind = payload.get("type")
+        user = CodexAgent.modern_prompt(rec) if modern else CodexAgent.old_prompt(rec)
+        if user and not user.startswith("<turn_aborted>"):
+            counter.advance(user=True)
+            in_results = False
+        elif rec.get("type") == "response_item":
+            if kind in ("function_call_output", "custom_tool_call_output"):
+                if not in_results:
+                    counter.advance()
+                in_results = True
+            elif kind in ("message", "reasoning", "function_call", "custom_tool_call", "web_search_call"):
+                in_results = False
+        counts[id(rec)] = counter.counts
+    return counts
+
+
+def opencode_accumulations(messages) -> list[tuple[int, int]]:
+    """Each assistant row is a response; another response extends the context."""
+    counter = Accumulation()
+    responded = False
+    counts = []
+    for typ, data in messages:
+        if typ == "user" and (data.get("text") or "").strip():
+            counter.advance(user=True)
+            responded = False
+        elif typ == "assistant" and data.get("content"):
+            if responded:
+                counter.advance()
+            responded = True
+        counts.append(counter.counts)
+    return counts
+
+
+def codex_model_inputs(records, counts):
+    """Explicit input records only; never infer a request from generated output.
+
+    A tool result is included when the log shows the following model response,
+    before a new user turn. Event copies, usage, summaries, turn/session metadata
+    and unverified re-sends of assistant output are excluded.
+    """
+    continued = set()
+    response = False
+    for rec in reversed(records):
+        if response:
+            continued.add(id(rec))
+        payload = rec.get("payload") or {}
+        if rec.get("type") != "response_item":
+            continue
+        kind = payload.get("type")
+        if kind in ("reasoning", "function_call", "custom_tool_call", "web_search_call") or (
+            kind == "message" and payload.get("role") == "assistant"
+        ):
+            response = True
+        elif kind == "message" and payload.get("role") == "user" and CodexAgent.modern_prompt(rec):
+            response = False
+    modern = any(CodexAgent.modern_prompt(rec) for rec in records)
+    inputs = []
+    for index, rec in enumerate(records):
+        payload = rec.get("payload") or {}
+        kind = payload.get("type")
+        role = None
+        lines = []
+        if rec.get("type") == "response_item":
+            if kind == "message" and payload.get("role") in ("user", "system", "developer"):
+                role = payload["role"]
+                lines = input_content_lines(payload.get("content"))
+            elif kind in ("function_call_output", "custom_tool_call_output") and id(rec) in continued:
+                role = "tool"
+                lines = input_content_lines(payload.get("output"))
+        elif not modern and CodexAgent.old_prompt(rec):
+            role = "user"
+            lines = input_content_lines(payload.get("message"))
+        if role is not None and lines:
+            source = f"model input; record [{index}]"
+            if role == "tool":
+                source += f" call_id={payload.get('call_id') or '?'}"
+            inputs.append(ModelInput(role, lines, record_ts(rec), counts[id(rec)], source))
+    return inputs
+
+
+def opencode_model_inputs(messages, counts):
+    """User text and tool results consumed by a recorded continuation.
+
+    System/log rows and generated summaries/replies do not prove API input.
+    """
+    continued = set()
+    response = False
+    for index in range(len(messages) - 1, -1, -1):
+        typ, data = messages[index]
+        if response:
+            continued.add(index)
+        if typ == "assistant" and data.get("content"):
+            response = True
+        elif typ == "user" and (data.get("text") or "").strip():
+            response = False
+    inputs = []
+    for index, (typ, data) in enumerate(messages):
+        ts = OpenCodeAgent.timestamp(data.get("time") or {})
+        if typ == "user":
+            lines = input_content_lines(data.get("text"))
+            if lines:
+                inputs.append(ModelInput("user", lines, ts, counts[index], f"model input; message [{index}]"))
+        elif typ == "assistant" and index in continued:
+            for part in data.get("content") or []:
+                if not isinstance(part, dict) or part.get("type") != "tool":
+                    continue
+                state = part.get("state") or {}
+                lines = input_content_lines(state.get("content"))
+                if lines:
+                    next_index = next(i for i in range(index + 1, len(messages))
+                                      if messages[i][0] == "assistant" and messages[i][1].get("content"))
+                    inputs.append(ModelInput("tool", lines, ts, counts[next_index],
+                                             f"model input; tool={part.get('name') or '?'} message [{index}]"))
+    return inputs
+
+
+def codex_view(s: Session, view: "ViewBuilder", tmpdir: Path,
+               options: ViewOptions | None = None) -> None:
     """Render a Codex rollout: prompts, reasoning summaries, tool calls and replies.
 
     A model response is one loop: its reasoning, message and calls until the
@@ -2455,8 +2847,19 @@ def codex_view(s: Session, view: "ViewBuilder", tmpdir: Path) -> None:
     as a model-visible response_item and an event_msg copy; one kind is used,
     never both."""
     records = list(read_jsonl(s.path))
+    options = options or ViewOptions()
+    counts = codex_accumulations(records)
+    inputs = codex_model_inputs(records, counts)
+    view.count_width = len(str(max((max(pair) for pair in counts.values()), default=0)))
+    view_header(view, s)
+    view.lines.extend([view_meta("累加按日志中的用户输入与工具结果批次推算；重复 event 不增加计数。"), ""])
+    if options.raw:
+        render_model_inputs(view, inputs)
+        return
+    parts = set(options.normal_parts)
     modern = any(CodexAgent.modern_prompt(rec) for rec in records)
     outputs: dict[str, str] = {}
+    output_counts = {}
     for rec in records:
         payload = rec.get("payload") or {}
         if rec.get("type") != "response_item":
@@ -2464,11 +2867,11 @@ def codex_view(s: Session, view: "ViewBuilder", tmpdir: Path) -> None:
         if payload.get("type") in ("function_call_output", "custom_tool_call_output"):
             output = payload.get("output")
             if isinstance(payload.get("call_id"), str):
+                output_counts[payload["call_id"]] = counts[id(rec)]
                 outputs[payload["call_id"]] = (
                     output if isinstance(output, str) else json.dumps(output, ensure_ascii=False)
                 )
 
-    view_header(view, s)
     builder = TurnBuilder()
     response_open = False
 
@@ -2480,7 +2883,7 @@ def codex_view(s: Session, view: "ViewBuilder", tmpdir: Path) -> None:
 
     def finish_turn() -> None:
         nonlocal response_open
-        render_turn(view, builder.turn, tmpdir)
+        render_turn(view, builder.turn, tmpdir, parts=parts)
         builder.reset()
         response_open = False
 
@@ -2489,6 +2892,7 @@ def codex_view(s: Session, view: "ViewBuilder", tmpdir: Path) -> None:
         builder.set_user(ts, "", "USER", text)
 
     for rec in records:
+        builder.counts = counts[id(rec)]
         payload = rec.get("payload") or {}
         kind = payload.get("type")
         ts = record_ts(rec)
@@ -2502,6 +2906,22 @@ def codex_view(s: Session, view: "ViewBuilder", tmpdir: Path) -> None:
                     # <turn_aborted> is injected context; event_msg reports the interrupt.
                     if text and not text.startswith("<turn_aborted>"):
                         new_user(ts, text)
+                    elif not text:
+                        context = "".join(
+                            block.get("text", "") for block in payload.get("content") or []
+                            if isinstance(block, dict) and block.get("type") == "input_text"
+                        )
+                        if context:
+                            builder.add_note(f"{ts} USER injected context", context.splitlines(),
+                                             category="system", metadata=False)
+                elif role in ("system", "developer"):
+                    context = "\n".join(
+                        block.get("text", "") for block in payload.get("content") or []
+                        if isinstance(block, dict) and isinstance(block.get("text"), str)
+                    )
+                    if context:
+                        builder.add_note(f"{ts} {role.upper()}", context.splitlines(),
+                                         category="system", metadata=False)
                 elif role == "assistant":
                     text = "\n".join(
                         block.get("text", "")
@@ -2512,10 +2932,11 @@ def codex_view(s: Session, view: "ViewBuilder", tmpdir: Path) -> None:
                         begin_response(ts)
                         builder.add_text(ts, "", text)
             elif kind == "reasoning":
-                text = codex_reasoning(payload)
-                if text:
-                    begin_response(ts)
-                    builder.add_thinking(ts, "", "THINKING", text)
+                for source, label in (("summary", "REASONING SUMMARY"), ("content", "THINKING")):
+                    text = codex_reasoning({source: payload.get(source)})
+                    if text:
+                        begin_response(ts)
+                        builder.add_thinking(ts, "", label, text, metadata=source == "summary")
             elif kind == "function_call":
                 begin_response(ts)
                 builder.add_call(
@@ -2524,12 +2945,14 @@ def codex_view(s: Session, view: "ViewBuilder", tmpdir: Path) -> None:
                     payload.get("name") or "?",
                     parse_arguments(payload.get("arguments")),
                     outputs.get(payload.get("call_id")),
+                    output_counts=output_counts.get(payload.get("call_id")),
                 )
             elif kind == "custom_tool_call":
                 begin_response(ts)
                 builder.add_call(
                     ts, "", payload.get("name") or "?",
                     {"input": payload.get("input")}, outputs.get(payload.get("call_id")),
+                    output_counts=output_counts.get(payload.get("call_id")),
                 )
             elif kind == "web_search_call":
                 begin_response(ts)
@@ -2550,29 +2973,42 @@ def codex_view(s: Session, view: "ViewBuilder", tmpdir: Path) -> None:
                 if text:
                     builder.add_note(f"{ts} {kind.replace('_', ' ')}", str(text).splitlines())
     finish_turn()
+    render_model_inputs(view, inputs, missing_only=True, parts=parts)
 
 
-def opencode_view(agent: "OpenCodeAgent", s: Session, view: "ViewBuilder", tmpdir: Path) -> None:
+def opencode_view(agent: "OpenCodeAgent", s: Session, view: "ViewBuilder", tmpdir: Path,
+                  options: ViewOptions | None = None) -> None:
     """Render an OpenCode session: message text, reasoning and tool calls.
 
     One assistant message is one response loop. A tool part carries its own
     input and result, so no separate pairing pass is needed."""
+    options = options or ViewOptions()
+    messages = agent.messages(s)
+    counts = opencode_accumulations(messages)
+    inputs = opencode_model_inputs(messages, counts)
+    view.count_width = len(str(max((max(pair) for pair in counts), default=0)))
     view_header(view, s)
+    view.lines.extend([view_meta("累加按已记录的用户消息和后续 assistant 响应推算。"), ""])
+    if options.raw:
+        render_model_inputs(view, inputs)
+        return
+    parts = set(options.normal_parts)
     builder = TurnBuilder()
-    for typ, data in agent.messages(s):
+    for message_index, ((typ, data), pair) in enumerate(zip(messages, counts)):
+        builder.counts = pair
         ts = OpenCodeAgent.timestamp(data.get("time") or {})
         if typ == "user":
             text = (data.get("text") or "").strip()
             if text:
-                render_turn(view, builder.turn, tmpdir)
+                render_turn(view, builder.turn, tmpdir, parts=parts)
                 builder.reset()
                 builder.set_user(ts, "", "USER", text)
         elif typ == "assistant":
-            parts = [part for part in data.get("content") or [] if isinstance(part, dict)]
-            if not parts:
+            content_parts = [part for part in data.get("content") or [] if isinstance(part, dict)]
+            if not content_parts:
                 continue
             builder.start_loop(ts)
-            for part in parts:
+            for part in content_parts:
                 part_ts = OpenCodeAgent.timestamp(part.get("time") or {}) or ts
                 kind = part.get("type")
                 if kind == "reasoning":
@@ -2592,19 +3028,25 @@ def opencode_view(agent: "OpenCodeAgent", s: Session, view: "ViewBuilder", tmpdi
                         output = error.get("message") if isinstance(error, dict) else None
                     else:
                         output = text_of(state.get("content"))
-                    builder.add_call(part_ts, "", part.get("name") or "?", inp, output, failed)
+                    next_pair = next((counts[i] for i in range(message_index + 1, len(messages))
+                                      if messages[i][0] in ("assistant", "user")), None)
+                    builder.add_call(part_ts, "", part.get("name") or "?", inp, output, failed,
+                                     output_counts=next_pair)
         elif typ == "compaction":
             summary = (data.get("summary") or "").strip()
             builder.add_note(
                 f"{ts} context compacted ({data.get('reason') or 'auto'})",
-                summary.splitlines() or ["(no summary)"],
+                summary.splitlines() or [view_meta("(no summary)")],
+                category="compaction",
+                metadata=False,
             )
         elif typ == "system":
             text = (data.get("text") or "").strip()
             if text:
-                builder.add_note(f"{ts} SYSTEM: {text_preview(text)}", text.splitlines())
+                builder.add_note(f"{ts} SYSTEM: {text_preview(text)}", text.splitlines(), category="system")
         # idle and synthetic records carry no conversation text
-    render_turn(view, builder.turn, tmpdir)
+    render_turn(view, builder.turn, tmpdir, parts=parts)
+    render_model_inputs(view, inputs, missing_only=True, parts=parts)
 
 
 def vim_viewer_script(folds: list[tuple[int, int]]) -> str:
@@ -2619,6 +3061,7 @@ def vim_viewer_script(folds: list[tuple[int, int]]) -> str:
         "setlocal foldenable",
         "setlocal foldminlines=0",
         "setlocal foldcolumn=1",
+        "setlocal foldtext=getline(v:foldstart)",
         "setlocal nobuflisted",
         "setlocal noswapfile",
         "setlocal wrap",
@@ -2777,7 +3220,7 @@ def interactive_menu(cwd: Path | None) -> int:
             marks = []
             continue
         if kind == "view":
-            changed = edit_view_options(view_options)
+            changed = edit_view_options(view_options, payload.agent)
             if changed is None:  # Esc at the menu: back to the picker
                 continue
             view_options = changed

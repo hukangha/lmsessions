@@ -123,9 +123,29 @@ toggles a fold.
 
 `message_section()` and `tool_section()` build the shared USER/ASSISTANT/
 THINKING and tool-call folds; `view_header()` writes the title block.
+`ViewBuilder.abstract()` formats fixed columns for user/all accumulation counts,
+timestamp, `[index]`, kind and summary text. One request's messages share its pair: initial `0/0`, next
+user addition `1/1`, automatic tool continuation `1/2`. Claude counts actual
+context extensions (identical retries stay unchanged); Codex/OpenCode infer
+them from prompts/tool-result batches/response boundaries. `TurnBuilder` saves
+counts on users, items and loops so hoisting/filtering does not change them.
+Tool results get a nested fold with their continuation counts when available.
+`request_message_section()` gives each Claude API-body message its own fold.
+`ModelInput`/`render_model_inputs()` are the shared raw-input projection. Normal
+mode includes that projection's source/count metadata and adds any exact input
+text absent from its usual sections, so the full normal view contains raw's
+content. Explicit normal type filters still apply. Each projected message has
+a stable `[index]`. Raw contains original input text and associated annotations,
+never whole JSONL envelopes, usage records or runtime event copies.
+Viewer-generated headers, labels, diagnostics and log metadata are prefixed
+`⟦meta⟧` via `view_meta()`. Conversation/request text keeps its content;
+Claude's local `toolUseResult` display is prefixed `⟦local⟧` because it can
+differ from the model-visible result. Tool calls are labelled assistant and
+results tool. API `user` roles can contain tool results or injected context.
+Reasoning summaries are distinguished from original thinking and marked meta.
 
-`ViewOptions` (`max_messages`, `normal_parts`, `raw_parts`, `raw`,
-`accumulative`) is kept by the menu loop. `v` opens `edit_view_options()` first;
+`ViewOptions` (`max_messages`, `normal_parts`, `raw`)
+is kept by the menu loop. `v` opens `edit_view_options()` first;
 Enter there renders with the options, Esc returns to the picker. The normal-mode
 list is every foldable section kind (`user`, `assistant`, `system`, `thinking`,
 `tool`, `note`, `attachment`, `api`, `loop`, `procedure`); the roles also filter
@@ -134,10 +154,22 @@ only their grouping fold). Normal mode also
 shows the last `max_messages` entries of each API request body in full content,
 eliding the front with `......`; the system prompt heads the list and counts as
 one entry, so a small limit omits it (`0` = none, `-1` = the whole body). Raw mode
-(`raw`) shows only reconstructed request bodies, filtered by `raw_parts` (roles
-and block kinds): the latest request, or with `accumulative` every request's
-growing prefix, marking messages added since the previous request with `+`.
-Non-Claude views accept `options` and ignore it.
+(`raw`) has no type-selection menu. `claude_model_inputs()` unions reconstructed
+request messages, keyed by hash plus occurrence number, and system text. Each
+message occurrence is displayed once, with latest-send counts updated in meta;
+distinct identical prompts remain distinct. There is no accumulative toggle or
+repeated request-prefix display. Unrecoverable bodies and non-text payloads are
+excluded rather than invented. `codex_model_inputs()`/`opencode_model_inputs()`
+project explicit input text and tool results followed by a logged continuation.
+Their logs cannot prove complete API bodies or historical assistant re-sends;
+raw excludes generated outputs, reasoning summaries and system/log notes rather
+than guessing. `input_content_lines()` extracts textual blocks and tool inputs,
+omitting images, encrypted data, signatures and unknown non-text blocks.
+All three normal views apply `normal_parts`; `normal_view_labels(agent)` offers
+only applicable categories, with explanations. Codex's system category includes
+system/developer messages and injected user context; OpenCode has a separate
+compaction category. Only Claude offers the API body message limit, entered
+directly with digits/`-`/Backspace (`-1` = all, `0` = none).
 
 All three views feed `TurnBuilder`, so they share one turn shape:
 `render_turn()` writes USER, wraps repeated loops (and any items before the
@@ -193,7 +225,7 @@ compact, sorted-key JSON). It reattaches `cacheControl` paths to the blocks they
 mark, parses the stringified tool `input_schema`, and returns a `RequestBody`
 (`payload()` strips `betas`, which is a request option, not a body field).
 Unrecoverable hashes become placeholders and are listed in `missing`.
-`render_request()` and `render_raw_view()` use it.
+`render_request()` and `claude_model_inputs()` use it.
 
 A rewind leaves the abandoned branch in the jsonl. `claude_active_uuids()` keeps
 only records on the live branch: start from the newest conversation record (or
@@ -209,6 +241,8 @@ filter, so the prompt count and fallback title ignore rewound prompts.
 length): creating an outer fold first makes Vim raise that whole fold's level
 for every range nested in it. `view_session()` sets `nomodeline` in `--cmd` and
 again before `:edit`, so transcript text cannot run as a modeline.
+`foldtext=getline(v:foldstart)` displays the summary directly, keeping count
+columns aligned across fold depths and differing folded line counts.
 
 ## Interactive picker (`pick_sessions`) — the bulk of the code
 
