@@ -137,6 +137,14 @@ text absent from its usual sections, so the full normal view contains raw's
 content. Explicit normal type filters still apply. Each projected message has
 a stable `[index]`. Raw contains original input text and associated annotations,
 never whole JSONL envelopes, usage records or runtime event copies.
+Raw attaches message folds directly, with no outer MODEL INPUT fold. Normal
+mode keeps the grouping fold. `content_source()` separates content provenance
+from API role: tool results, injected context and compact summaries are not
+labelled USER. Claude raw splits mixed-source block groups; normal API headers
+label mixed sources explicitly. `claude_source_hints()` carries record-level
+meta/summary provenance into reconstructed request messages. Synthetic Codex
+context (including AGENTS.md instructions) and flagged OpenCode user rows do
+not increment the actual-user counter.
 Viewer-generated headers, labels, diagnostics and log metadata are prefixed
 `⟦meta⟧` via `view_meta()`. Conversation/request text keeps its content;
 Claude's local `toolUseResult` display is prefixed `⟦local⟧` because it can

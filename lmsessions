@@ -325,7 +325,10 @@ class CodexAgent(Agent):
         return out
 
     # Records newer Codex versions inject as user messages that the user never typed.
-    SYNTHETIC = ("<environment_context", "<user_instructions", "<external_codex_apps_open_page")
+    SYNTHETIC = (
+        "<environment_context", "<user_instructions", "<external_codex_apps_open_page",
+        "# AGENTS.md instructions for ", "<turn_aborted>", "<subagent_notification",
+    )
 
     @staticmethod
     def modern_prompt(rec: dict) -> str:
@@ -337,14 +340,15 @@ class CodexAgent(Agent):
             b.get("text", "") for b in p.get("content") or []
             if isinstance(b, dict) and b.get("type") in ("input_text", "text")
         ).strip()
-        return "" if text.startswith(CodexAgent.SYNTHETIC) else text
+        return text if content_source("user", p.get("content"), p) == "user" else ""
 
     @staticmethod
     def old_prompt(rec: dict) -> str:
         """Text of an older Codex user message (`event_msg`/`user_message`), else ''."""
         p = rec.get("payload") or {}
         if rec.get("type") == "event_msg" and p.get("type") == "user_message":
-            return (p.get("message") or "").strip()
+            text = (p.get("message") or "").strip()
+            return text if content_source("user", text, p) == "user" else ""
         return ""
 
     @staticmethod
@@ -1454,6 +1458,7 @@ class ViewBuilder:
         self.spills = 0
         self.counts: tuple[int, int] | None = None
         self.count_width = 1
+        self.source_hints = {}
 
     def abstract(self, header: str) -> str:
         """Align counters, time, index, kind and the start of summary text."""
@@ -1474,7 +1479,7 @@ class ViewBuilder:
             header = header[2:]
         match = re.match(
             r"^(CONTEXT SUMMARY|PROCEDURE|DEVELOPER|ASSISTANT|THINKING|ATTACHMENT|"
-            r"SYSTEM|USER|TOOL|LOOP|API|MODEL INPUT|RESULT)\b[: ]*", header, re.I,
+            r"SYSTEM|USER|TOOL|LOOP|API|MODEL INPUT|RESULT|CONTEXT|SUMMARY|MIXED)\b[: ]*", header, re.I,
         )
         kind = match.group(1).upper() if match else "NOTE"
         text = header[match.end():] if match else header
@@ -1720,9 +1725,42 @@ def block_kind(block) -> str:
     return kind if kind in ("text", "thinking", "tool_use", "tool_result") else "other"
 
 
-def message_lines(index: int, message: dict, marker: str = "", parts=None) -> list[str]:
+def content_source(role, content, record=None, hints=None) -> str:
+    """Distinguish content provenance from the API's overloaded user role."""
+    if role != "user":
+        return role or "unknown"
+    record = record or {}
+    if record.get("isCompactSummary"):
+        return "summary"
+    if any(record.get(key) for key in ("isMeta", "synthetic", "isSynthetic")):
+        return "context"
+    if isinstance(content, list):
+        sources = {content_source(role, block, record, hints) for block in content if isinstance(block, dict)}
+        return next(iter(sources)) if len(sources) == 1 else "mixed" if sources else "user"
+    if isinstance(content, dict):
+        if content.get("type") == "tool_result":
+            return "tool"
+        return content_source(role, content.get("text", ""), record, hints)
+    text = content if isinstance(content, str) else ""
+    hint = hints.get(text, hints.get(text.strip(), set())) if hints else set()
+    if len(hint) == 1:
+        return next(iter(hint))
+    if text.lstrip().startswith(CodexAgent.SYNTHETIC + ("<local-command", "<command-name", "<command-message")):
+        return "context"
+    if re.fullmatch(r"\s*<system-reminder>.*</system-reminder>\s*", text, re.S):
+        return "context"
+    return "user"
+
+
+def source_category(source):
+    return {"developer": "system", "context": "system", "summary": "system",
+            "mixed": "system", "system": "system"}.get(source, source)
+
+
+def message_lines(index: int, message: dict, marker: str = "", parts=None, hints=None) -> list[str]:
     """A full request message in readable form. parts filters block kinds (None = all)."""
     role = message.get("role") or "?"
+    source = content_source(role, message.get("content"), hints=hints)
     content = message.get("content")
     body: list[str] = []
     if isinstance(content, str):
@@ -1761,12 +1799,13 @@ def message_lines(index: int, message: dict, marker: str = "", parts=None) -> li
     label = "" if index is None else f"[{index}]"  # None: the request's system prompt
     if role == "missing":
         body = [view_meta(line) for line in body]
-    return [view_meta(f"{label}{marker} {role}".strip())] + body
+    provenance = f" (API role={role})" if source != role else ""
+    return [view_meta(f"{label}{marker} {source}{provenance}".strip())] + body
 
 
 def request_message_section(view, index, message, marker="") -> None:
     """Give every request message an independently foldable, counted abstract."""
-    lines = message_lines(index, message, marker)
+    lines = message_lines(index, message, marker, hints=view.source_hints)
     label = lines[0].removeprefix("⟦meta⟧ ")
     view.section(f"{label}: {text_preview(chr(10).join(lines[1:]))}", lines[1:])
 
@@ -1817,7 +1856,7 @@ def render_model_inputs(view, inputs, missing_only=False, parts=None) -> None:
     content = ViewBuilder()
     content.count_width = view.count_width
     for index, message in enumerate(inputs):
-        category = {"developer": "system", "system": "system", "tool": "tool"}.get(message.role, message.role)
+        category = source_category(message.role)
         if parts is not None and category not in parts:
             continue
         # Normal mode can hide categories or abbreviate API bodies, but its
@@ -1835,7 +1874,12 @@ def render_model_inputs(view, inputs, missing_only=False, parts=None) -> None:
                         [view_meta(message.source)] + body)
     if content.lines:
         view.counts = None
-        view.section("MODEL INPUT: 原始输入正文（每条消息一次；累计次数仅在 meta 中）", content)
+        if missing_only:
+            view.section("MODEL INPUT: 原始输入正文（每条消息一次；累计次数仅在 meta 中）", content)
+        else:
+            offset = len(view.lines)
+            view.lines.extend(content.lines)
+            view.folds.extend((a + offset, b + offset) for a, b in content.folds)
     elif not missing_only:
         view.section("MODEL INPUT", [view_meta("(no recoverable sent text)")])
 
@@ -2079,6 +2123,7 @@ def render_request(view, rec, records, blobs, shapes, by_id, rebuilt, options) -
             lines.append(view_meta("......"))
         content = ViewBuilder()
         content.counts, content.count_width = view.counts, view.count_width
+        content.source_hints = view.source_hints
         content.lines = lines
         for index, message in shown:
             request_message_section(content, index, message)
@@ -2385,6 +2430,7 @@ def claude_accumulations(records, live, blobs, shapes, requests_by_id, rebuilt,
         for rec in records if rec.get("type") == "user"
         and not rec.get("isMeta") and not rec.get("isCompactSummary")
         and not rec.get("isSidechain")
+        and content_source("user", (rec.get("message") or {}).get("content"), rec) == "user"
     }
     prompts = {text for text in prompts if text and not text.startswith(
         ("<local-command", "<command-name", "<command-message")
@@ -2426,6 +2472,17 @@ def claude_accumulations(records, live, blobs, shapes, requests_by_id, rebuilt,
     return result
 
 
+def claude_source_hints(records):
+    hints = {}
+    for record in records:
+        if record.get("type") == "user":
+            message = record.get("message") or {}
+            text = ClaudeAgent.user_text(message)
+            if text:
+                hints.setdefault(text, set()).add(content_source("user", message.get("content"), record))
+    return hints
+
+
 def claude_model_inputs(records, live, blobs, shapes, requests_by_id, rebuilt, counts):
     """Union of messages actually present in requests; each occurrence once.
 
@@ -2434,6 +2491,7 @@ def claude_model_inputs(records, live, blobs, shapes, requests_by_id, rebuilt, c
     """
     inputs = []
     seen = {}
+    hints = claude_source_hints(records)
     for request_index, rec in enumerate(live):
         sent = claude_sent_hashes(rec, requests_by_id)
         body = claude_request_body(records, rec, blobs, shapes, requests_by_id, rebuilt)
@@ -2447,7 +2505,18 @@ def claude_model_inputs(records, live, blobs, shapes, requests_by_id, rebuilt, c
             if message.get("role") == "missing":
                 continue  # An unrecovered body is not original model-input text.
             key = (message_hash, occurrences[message_hash])
-            entries.append((key, message.get("role") or "?", input_content_lines(message.get("content"))))
+            role = message.get("role") or "?"
+            blocks = message.get("content")
+            groups = []
+            for block in blocks if isinstance(blocks, list) else [blocks]:
+                source = content_source(role, block, hints=hints)
+                lines = input_content_lines([block] if isinstance(block, dict) else block)
+                if groups and groups[-1][0] == source:
+                    groups[-1][1].extend(lines)
+                else:
+                    groups.append((source, lines))
+            for part, (source, lines) in enumerate(groups):
+                entries.append(((key, part), source, lines))
         for key, role, lines in entries:
             if not lines:
                 continue
@@ -2456,7 +2525,8 @@ def claude_model_inputs(records, live, blobs, shapes, requests_by_id, rebuilt, c
                 inputs.append(seen[key])
             entry = seen[key]
             entry.counts = counts[id(rec)]
-            entry.source = f"API input; latest request [{request_index}] id={rec.get('id') or '?'}"
+            entry.source = (f"API input; content source={role}; "
+                            f"latest request [{request_index}] id={rec.get('id') or '?'}")
     return inputs
 
 
@@ -2516,6 +2586,7 @@ def claude_view(s: Session, view: "ViewBuilder", tmpdir: Path, options: ViewOpti
     tool_counts = {}
     counts = claude_accumulations(records, live_records, blobs, shapes, requests_by_id, rebuilt, tool_counts)
     view.count_width = len(str(max((max(pair) for pair in counts.values()), default=len(records))))
+    view.source_hints = claude_source_hints(records)
     next_counts = {}
     upcoming = None
     for rec in reversed(records):
@@ -2571,11 +2642,14 @@ def claude_view(s: Session, view: "ViewBuilder", tmpdir: Path, options: ViewOpti
         ts = record_ts(rec)
         tag = "[subagent] " if rec.get("isSidechain") else ""
         if kind == "user":
-            if rec.get("isMeta"):
-                continue
             msg = rec.get("message")
             msg = msg if isinstance(msg, dict) else {}
             text = ClaudeAgent.user_text(msg)
+            source = content_source("user", msg.get("content"), rec)
+            if text and source != "user":
+                builder.add_note(f"{ts} {tag}{source.upper()}: {text_preview(text)}", text.splitlines(),
+                                 category="system", metadata=False)
+                continue
             synthetic = text.startswith(
                 ("<local-command", "<command-name", "<command-message")
             )
@@ -2744,7 +2818,7 @@ def opencode_accumulations(messages) -> list[tuple[int, int]]:
     responded = False
     counts = []
     for typ, data in messages:
-        if typ == "user" and (data.get("text") or "").strip():
+        if typ == "user" and (data.get("text") or "").strip() and content_source("user", data.get("text"), data) == "user":
             counter.advance(user=True)
             responded = False
         elif typ == "assistant" and data.get("content"):
@@ -2786,7 +2860,7 @@ def codex_model_inputs(records, counts):
         lines = []
         if rec.get("type") == "response_item":
             if kind == "message" and payload.get("role") in ("user", "system", "developer"):
-                role = payload["role"]
+                role = content_source(payload["role"], payload.get("content"), payload)
                 lines = input_content_lines(payload.get("content"))
             elif kind in ("function_call_output", "custom_tool_call_output") and id(rec) in continued:
                 role = "tool"
@@ -2798,6 +2872,8 @@ def codex_model_inputs(records, counts):
             source = f"model input; record [{index}]"
             if role == "tool":
                 source += f" call_id={payload.get('call_id') or '?'}"
+            elif payload.get("role") and role != payload["role"]:
+                source += f" API role={payload['role']}; content source={role}"
             inputs.append(ModelInput(role, lines, record_ts(rec), counts[id(rec)], source))
     return inputs
 
@@ -2823,7 +2899,9 @@ def opencode_model_inputs(messages, counts):
         if typ == "user":
             lines = input_content_lines(data.get("text"))
             if lines:
-                inputs.append(ModelInput("user", lines, ts, counts[index], f"model input; message [{index}]"))
+                role = content_source("user", data.get("text"), data)
+                inputs.append(ModelInput(role, lines, ts, counts[index],
+                                         f"model input; API role=user; content source={role}; message [{index}]"))
         elif typ == "assistant" and index in continued:
             for part in data.get("content") or []:
                 if not isinstance(part, dict) or part.get("type") != "tool":
@@ -2912,7 +2990,8 @@ def codex_view(s: Session, view: "ViewBuilder", tmpdir: Path,
                             if isinstance(block, dict) and block.get("type") == "input_text"
                         )
                         if context:
-                            builder.add_note(f"{ts} USER injected context", context.splitlines(),
+                            source = content_source("user", payload.get("content"), payload)
+                            builder.add_note(f"{ts} {source.upper()} (API role=user)", context.splitlines(),
                                              category="system", metadata=False)
                 elif role in ("system", "developer"):
                     context = "\n".join(
@@ -3000,6 +3079,11 @@ def opencode_view(agent: "OpenCodeAgent", s: Session, view: "ViewBuilder", tmpdi
         if typ == "user":
             text = (data.get("text") or "").strip()
             if text:
+                source = content_source("user", data.get("text"), data)
+                if source != "user":
+                    builder.add_note(f"{ts} {source.upper()} (API role=user)", text.splitlines(),
+                                     category="system", metadata=False)
+                    continue
                 render_turn(view, builder.turn, tmpdir, parts=parts)
                 builder.reset()
                 builder.set_user(ts, "", "USER", text)

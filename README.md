@@ -11,4 +11,6 @@ Codex/OpenCode do not log complete API requests: their raw views conservatively 
 
 Fold summaries align both counts, timestamps, `[number]`, message/group labels and the start of summary text. `用户累加` counts user additions; `所有累加` includes automatic tool-result continuations. Both start at zero. Request stages progress `0/0` → `1/1` on the next user addition → `1/2` on an automatic continuation. A deduplicated Claude message shows the latest request stage in which it was sent; identical retries do not increment counts. Codex/OpenCode counts are inferred from recorded prompts, tool-result batches and response boundaries. Fold text displays the header directly to preserve alignment across nesting depths.
 
+Raw opens directly on individual message folds, without an outer fold enclosing the entire view. Source labels distinguish real user text, tool results, injected context and compaction summaries even when their API role is `user`; mixed-source API messages are labelled `mixed`. User counters exclude recognized injected/synthetic context.
+
 Requires Python 3.10+
