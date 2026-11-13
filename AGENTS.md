@@ -15,9 +15,22 @@ picker. No tests, no build step; verify by running it.
 | `-a`              | `interactive_menu(None)` = every dir      |
 | `-l`              | `list_sessions($PWD)`                     |
 | `-l -a`           | `list_sessions(None)`                     |
+| `mv ID [DIR]`     | reassign one session's workspace          |
+| `mv SOURCE [DIR]` | reassign all sessions in SOURCE directory |
 
 `cwd` is `Path | None` everywhere; `None` means "every directory" and also
 turns on the CWD column.
+
+`move_sessions()` resolves an exact ID (or `agent:ID`) across all agents, or
+matches a source directory by realpath without recursion. The destination is
+an existing directory, defaulting to `$PWD`. Ambiguous IDs fail before writes.
+Each `Agent.move()` updates workspace metadata: Claude's top-level JSONL `cwd`
+(atomic replacement, original path/mtime/mode retained); Codex's `threads.cwd`;
+OpenCode's `session_v2.directory`; Antigravity's first `workspace_uris` entry.
+Claude listing scans all project buckets and filters by recorded cwd, since a
+moved session stays in its original storage bucket. A missing Claude cwd gets
+a leading workspace metadata record. Batch moves report successes, no-ops and
+failures; failures return nonzero, and completed session moves remain applied.
 
 ## Data model
 

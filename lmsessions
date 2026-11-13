@@ -162,6 +162,10 @@ class Agent:
     def remove(self, s: Session) -> None:
         raise NotImplementedError
 
+    def move(self, s: Session, directory: Path) -> None:
+        """Change workspace metadata while leaving transcript storage in place."""
+        raise NotImplementedError
+
     def resume(self, s: Session) -> None:
         raise NotImplementedError
 
@@ -179,10 +183,9 @@ class ClaudeAgent(Agent):
 
     def sessions(self, cwd: Path | None) -> list[Session]:
         projects = Path.home() / ".claude" / "projects"
-        if cwd is None:
-            files = projects.glob("*/*.jsonl")
-        else:
-            files = (projects / self.project_name(cwd)).glob("*.jsonl")
+        # A workspace change updates metadata, not the transcript's storage
+        # bucket. Inspect cwd even when the file lives in another project dir.
+        files = projects.glob("*/*.jsonl")
         out = []
         target = os.path.realpath(cwd) if cwd is not None else None
         for f in files:
@@ -191,6 +194,8 @@ class ClaudeAgent(Agent):
             # Distinct paths can share one project dir ("a_b" and "a.b" both become
             # "a-b"), so keep only sessions actually started in cwd.
             if target and scwd and os.path.realpath(scwd) != target:
+                continue
+            if target and not scwd and f.parent.name != self.project_name(cwd):
                 continue
             out.append(Session(self.name, f.stem, f.stat().st_mtime, size, prompts, title, f, scwd or str(cwd or "")))
         return out
@@ -234,6 +239,39 @@ class ClaudeAgent(Agent):
 
     def remove(self, s: Session) -> None:
         s.path.unlink()
+
+    def move(self, s: Session, directory: Path) -> None:
+        original = s.path.stat()
+        lines = []
+        changed = False
+        for line in s.path.read_bytes().splitlines(keepends=True):
+            try:
+                record = json.loads(line)
+            except (ValueError, UnicodeDecodeError):
+                lines.append(line)
+                continue
+            if isinstance(record, dict) and "cwd" in record:
+                record["cwd"] = str(directory)
+                line = (json.dumps(record, ensure_ascii=False) + "\n").encode()
+                changed = True
+            lines.append(line)
+        if not changed:
+            lines.insert(0, (json.dumps({"type": "lmsessions-workspace", "cwd": str(directory)}) + "\n").encode())
+        # Replace atomically, preserve session ordering/permissions, and refuse
+        # to overwrite a transcript that changed while we were editing it.
+        fd, name = tempfile.mkstemp(prefix=".workspace-", dir=s.path.parent)
+        temp = Path(name)
+        try:
+            with os.fdopen(fd, "wb") as stream:
+                stream.writelines(lines)
+            os.chmod(temp, original.st_mode & 0o777)
+            os.utime(temp, ns=(original.st_atime_ns, original.st_mtime_ns))
+            current = s.path.stat()
+            if (current.st_ino, current.st_size, current.st_mtime_ns) != (original.st_ino, original.st_size, original.st_mtime_ns):
+                raise OSError("Session changed during move; try again")
+            os.replace(temp, s.path)
+        finally:
+            temp.unlink(missing_ok=True)
 
     def resume(self, s: Session) -> None:
         exec_agent(s, ["claude", "--resume", s.id])
@@ -386,6 +424,15 @@ class CodexAgent(Agent):
             conn.close()
         s.path.unlink(missing_ok=True)
 
+    def move(self, s: Session, directory: Path) -> None:
+        conn = sqlite3.connect(self.db, timeout=10)
+        try:
+            with conn:
+                if conn.execute("UPDATE threads SET cwd = ? WHERE id = ?", (str(directory), s.id)).rowcount != 1:
+                    raise ValueError("Session no longer exists")
+        finally:
+            conn.close()
+
     def resume(self, s: Session) -> None:
         exec_agent(s, ["codex", "resume", s.id])
 
@@ -481,6 +528,15 @@ class OpenCodeAgent(Agent):
 
     def resume(self, s: Session) -> None:
         exec_agent(s, ["opencode", "--session", s.id])
+
+    def move(self, s: Session, directory: Path) -> None:
+        conn = self.connect(readonly=False)
+        try:
+            with conn:
+                if conn.execute("UPDATE session_v2 SET directory = ? WHERE id = ?", (str(directory), s.id)).rowcount != 1:
+                    raise ValueError("Session no longer exists")
+        finally:
+            conn.close()
 
     def view(self, s: Session, view: "ViewBuilder", tmpdir: Path, options: ViewOptions) -> None:
         opencode_view(self, s, view, tmpdir, options)
@@ -591,6 +647,22 @@ class AgyAgent(Agent):
 
     def log_path(self, sid: str) -> Path:
         return self.brain / sid / ".system_generated" / "logs" / "transcript.jsonl"
+
+    def move(self, s: Session, directory: Path) -> None:
+        conn = sqlite3.connect(self.db, timeout=10)
+        try:
+            with conn:
+                row = conn.execute("SELECT workspace_uris FROM conversation_summaries WHERE conversation_id = ?", (s.id,)).fetchone()
+                if row is None:
+                    raise ValueError("Session no longer exists")
+                workspaces = json.loads(row[0] or "[]")
+                if not isinstance(workspaces, list):
+                    raise ValueError("Invalid workspace_uris: expected a list")
+                workspaces = [directory.as_uri()] + workspaces[1:]
+                conn.execute("UPDATE conversation_summaries SET workspace_uris = ? WHERE conversation_id = ?",
+                             (json.dumps(workspaces, ensure_ascii=False), s.id))
+        finally:
+            conn.close()
 
     @staticmethod
     def workspace(uris: str) -> str:
@@ -3386,6 +3458,46 @@ def interactive_menu(cwd: Path | None) -> int:
         focus = rows[min(here, len(rows) - 1)]
 
 
+def move_sessions(source: str, directory: Path) -> int:
+    """Reassign an exact session ID, or every session in one source directory."""
+    try:
+        directory = directory.expanduser().resolve(strict=True)
+        if not directory.is_dir():
+            raise ValueError(f"Not a directory: {directory}")
+        source_path = Path(source).expanduser()
+        source_dir = source_path.resolve() if source_path.is_dir() else None
+        sessions = all_sessions(None)
+        if source_dir is not None:
+            selected = [s for s in sessions if s.cwd and os.path.realpath(s.cwd) == str(source_dir)]
+        else:
+            agent, sep, sid = source.partition(":")
+            if sep:
+                selected = [s for s in sessions if s.agent == agent and s.id == sid]
+            else:
+                selected = [s for s in sessions if s.id == source]
+            if len(selected) > 1:
+                raise ValueError("Ambiguous session ID; use agent:session-id (" +
+                                 ", ".join(f"{s.agent}:{s.id}" for s in selected) + ")")
+        if not selected:
+            raise ValueError(f"No sessions found for {source}")
+    except (OSError, ValueError, sqlite3.Error) as e:
+        print(f"Cannot move sessions: {e}", file=sys.stderr)
+        return 1
+    moved = unchanged = failed = 0
+    for session in selected:
+        if session.cwd and os.path.realpath(session.cwd) == str(directory):
+            unchanged += 1
+            continue
+        try:
+            agent_of(session).move(session, directory)
+            moved += 1
+        except (OSError, ValueError, sqlite3.Error) as e:
+            failed += 1
+            print(f"Cannot move {session.agent}:{session.id}: {e}", file=sys.stderr)
+    print(f"Moved {moved} session(s) to {directory} ({unchanged} already there, {failed} failed)")
+    return 1 if failed else 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="List, search, remove or resume "
@@ -3402,7 +3514,16 @@ def main() -> int:
         action="store_true",
         help="apply to sessions in every directory, not just $PWD",
     )
+    commands = parser.add_subparsers(dest="command")
+    move = commands.add_parser("mv", help="change session workspace metadata")
+    move.add_argument("source", help="exact session ID (or agent:ID), or a source directory")
+    move.add_argument("directory", nargs="?", type=Path, default=Path.cwd(),
+                      help="destination directory (default: current directory)")
     args = parser.parse_args()
+    if args.command == "mv":
+        if args.l or args.all:
+            parser.error("mv cannot be combined with -l/--list or -a/--all")
+        return move_sessions(args.source, args.directory)
     cwd = None if args.all else Path(os.getcwd()).resolve()
     return list_sessions(cwd) if args.l else interactive_menu(cwd)
 
