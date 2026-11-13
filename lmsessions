@@ -1449,6 +1449,15 @@ VIEW_ATTACHMENTS = {
 }
 
 
+@dataclass
+class ViewHeading:
+    timestamp: str
+    index: str
+    kind: str
+    text: str
+    counts: tuple[int, int] | None
+
+
 class ViewBuilder:
     """Viewer text plus the 1-based (start, end) line ranges to fold."""
 
@@ -1459,9 +1468,10 @@ class ViewBuilder:
         self.counts: tuple[int, int] | None = None
         self.count_width = 1
         self.source_hints = {}
+        self.headings: dict[int, ViewHeading] = {}
 
     def abstract(self, header: str) -> str:
-        """Align counters, time, index, kind and the start of summary text."""
+        """Register a heading; layout fits its columns once every fold is known."""
         ts = ""
         match = re.match(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s*", header)
         if match:
@@ -1486,11 +1496,37 @@ class ViewBuilder:
         if kind == "RESULT":
             kind = "TOOL"
             text = "result " + text
-        user, total = self.counts if self.counts is not None else ("-", "-")
-        return view_meta(
-            f"用户累加 {user:>{self.count_width}}  所有累加 {total:>{self.count_width}} │ "
-            f"{ts:19} │ {index:8} {kind:16} │ {tag}{text}"
-        )
+        self.headings[len(self.lines) + 1] = ViewHeading(ts, index, kind, tag + text, self.counts)
+        return view_meta(header)
+
+    def layout(self, raw: bool = False) -> None:
+        """Fit columns to real values and indent only normal-view headings.
+
+        Compute hierarchy from final fold ranges so hidden grouping options,
+        nested request bodies and hoisted final replies all indent correctly.
+        """
+        rows = []
+        ranges = iter(sorted(self.folds, key=lambda pair: (pair[0], -pair[1])))
+        upcoming = next(ranges, None)
+        ancestors = []
+        for line, heading in sorted(self.headings.items()):
+            while upcoming is not None and upcoming[0] < line:
+                ancestors = [pair for pair in ancestors if pair[1] >= upcoming[0]]
+                ancestors.append(upcoming)
+                upcoming = next(ranges, None)
+            ancestors = [pair for pair in ancestors if pair[1] >= line]
+            in_loop = not raw and any(
+                self.headings.get(a) and self.headings[a].kind == "LOOP" for a, _ in ancestors
+            )
+            counts = heading.counts if not in_loop else None
+            fields = [f"USER[{counts[0]}]" if counts else "",
+                      f"MSG[{counts[1]}]" if counts else "",
+                      heading.index, heading.timestamp, heading.kind]
+            rows.append((line, heading, fields, 0 if raw else len(ancestors)))
+        widths = [max((len(fields[i]) for _, _, fields, _ in rows), default=0) for i in range(5)]
+        for line, heading, fields, depth in rows:
+            columns = " ".join(f"{value:<{width}}" for value, width in zip(fields, widths) if width)
+            self.lines[line - 1] = "  " * depth + view_meta(columns + " " + heading.text)
 
     def section(self, header: str, body: "list[str] | ViewBuilder") -> None:
         start = len(self.lines) + 1
@@ -1498,6 +1534,7 @@ class ViewBuilder:
         if isinstance(body, ViewBuilder):
             offset = len(self.lines)
             self.folds.extend((a + offset, b + offset) for a, b in body.folds)
+            self.headings.update((line + offset, heading) for line, heading in body.headings.items())
             body = body.lines
         self.lines.extend(body)
         if body:
@@ -1880,6 +1917,7 @@ def render_model_inputs(view, inputs, missing_only=False, parts=None) -> None:
             offset = len(view.lines)
             view.lines.extend(content.lines)
             view.folds.extend((a + offset, b + offset) for a, b in content.folds)
+            view.headings.update((line + offset, heading) for line, heading in content.headings.items())
     elif not missing_only:
         view.section("MODEL INPUT", [view_meta("(no recoverable sent text)")])
 
@@ -2596,12 +2634,13 @@ def claude_view(s: Session, view: "ViewBuilder", tmpdir: Path, options: ViewOpti
 
     view_header(view, s)
     view.lines.extend([
-        view_meta("用户累加 = 用户追加轮次；所有累加 = 含工具结果自动续发的追加轮次；初次均为 0"),
+        view_meta("USER[n] 用户追加轮次；MSG[n] 含工具结果自动续发的追加轮次；初次均为 0"),
         "",
     ])
     inputs = claude_model_inputs(records, live_records, blobs, shapes, requests_by_id, rebuilt, counts)
     if options.raw:
         render_model_inputs(view, inputs)
+        view.layout(raw=True)
         return
     builder = TurnBuilder()
     fallback = Accumulation()
@@ -2764,6 +2803,7 @@ def claude_view(s: Session, view: "ViewBuilder", tmpdir: Path, options: ViewOpti
             continue
     flush_turn()
     render_model_inputs(view, inputs, missing_only=True, parts=set(options.normal_parts))
+    view.layout()
 
 
 def parse_arguments(raw) -> dict:
@@ -2933,6 +2973,7 @@ def codex_view(s: Session, view: "ViewBuilder", tmpdir: Path,
     view.lines.extend([view_meta("累加按日志中的用户输入与工具结果批次推算；重复 event 不增加计数。"), ""])
     if options.raw:
         render_model_inputs(view, inputs)
+        view.layout(raw=True)
         return
     parts = set(options.normal_parts)
     modern = any(CodexAgent.modern_prompt(rec) for rec in records)
@@ -3053,6 +3094,7 @@ def codex_view(s: Session, view: "ViewBuilder", tmpdir: Path,
                     builder.add_note(f"{ts} {kind.replace('_', ' ')}", str(text).splitlines())
     finish_turn()
     render_model_inputs(view, inputs, missing_only=True, parts=parts)
+    view.layout()
 
 
 def opencode_view(agent: "OpenCodeAgent", s: Session, view: "ViewBuilder", tmpdir: Path,
@@ -3070,6 +3112,7 @@ def opencode_view(agent: "OpenCodeAgent", s: Session, view: "ViewBuilder", tmpdi
     view.lines.extend([view_meta("累加按已记录的用户消息和后续 assistant 响应推算。"), ""])
     if options.raw:
         render_model_inputs(view, inputs)
+        view.layout(raw=True)
         return
     parts = set(options.normal_parts)
     builder = TurnBuilder()
@@ -3131,6 +3174,7 @@ def opencode_view(agent: "OpenCodeAgent", s: Session, view: "ViewBuilder", tmpdi
         # idle and synthetic records carry no conversation text
     render_turn(view, builder.turn, tmpdir, parts=parts)
     render_model_inputs(view, inputs, missing_only=True, parts=parts)
+    view.layout()
 
 
 def vim_viewer_script(folds: list[tuple[int, int]]) -> str:

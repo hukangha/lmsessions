@@ -123,8 +123,18 @@ toggles a fold.
 
 `message_section()` and `tool_section()` build the shared USER/ASSISTANT/
 THINKING and tool-call folds; `view_header()` writes the title block.
-`ViewBuilder.abstract()` formats fixed columns for user/all accumulation counts,
-timestamp, `[index]`, kind and summary text. One request's messages share its pair: initial `0/0`, next
+`ViewBuilder.abstract()` registers structured `ViewHeading` metadata. After
+rendering, `ViewBuilder.layout(raw=...)` fits `USER[n]`/`MSG[n]`, `[index]`,
+timestamp and kind columns to their actual maximum displayed widths, with one
+space between columns and no vertical separators. The index precedes the
+timestamp so every timestamp is followed by exactly one space before the kind.
+Empty columns disappear. Normal headings indent two spaces per enclosing fold
+before the `⟦meta⟧` marker; raw headings stay flat. Within
+a LOOP fold, counts appear on the loop heading and are suppressed in child
+headings (their cells stay blank to preserve alignment). If loop grouping is
+hidden, individual items retain their counts. Layout leaves body text and fold
+ranges unchanged, and runs at the end of each agent's view renderer.
+One request's messages share its pair: initial `0/0`, next
 user addition `1/1`, automatic tool continuation `1/2`. Claude counts actual
 context extensions (identical retries stay unchanged); Codex/OpenCode infer
 them from prompts/tool-result batches/response boundaries. `TurnBuilder` saves
