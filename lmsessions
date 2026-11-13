@@ -16,6 +16,7 @@ import json
 import os
 import re
 import select
+import shlex
 import shutil
 import signal
 import sqlite3
@@ -24,6 +25,7 @@ import sys
 import tempfile
 import termios
 import tty
+import uuid
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -3458,12 +3460,528 @@ def interactive_menu(cwd: Path | None) -> int:
         focus = rows[min(here, len(rows) - 1)]
 
 
-def move_sessions(source: str, directory: Path) -> int:
+def sql_name(name: str) -> str:
+    return '"' + name.replace('"', '""') + '"'
+
+
+def remote_destination(value: str):
+    """scp-style host:path or ssh://user@host:port/path; local paths stay local."""
+    if value.startswith("ssh://"):
+        parsed = urlparse(value)
+        if parsed.password is not None or not parsed.hostname or not parsed.path:
+            raise ValueError("Use ssh://[user@]host[:port]/directory")
+        host = parsed.hostname
+        if ":" in host:
+            host = f"[{host}]"
+        host = (unquote(parsed.username) + "@" if parsed.username else "") + host
+        port, directory = parsed.port, unquote(parsed.path)
+    else:
+        match = re.fullmatch(r"((?:[^/@\s:]+@)?\[[^\]]+\]|[^/\s:\[\]]+):(.+)", value)
+        if not match:
+            return None
+        host, directory = match.groups()
+        port = None
+    if host.startswith("-") or not re.fullmatch(r"[\w.@\[\]:-]+", host):
+        raise ValueError("Invalid SSH host")
+    return host, port, directory
+
+
+def encoded_sql(value):
+    return {"bytes": base64.b64encode(value).decode()} if isinstance(value, bytes) else value
+
+
+def decoded_sql(value):
+    return base64.b64decode(value["bytes"], validate=True) if isinstance(value, dict) else value
+
+
+def session_database(agent, session):
+    """Export one session's rows, owned children and referenced shared metadata.
+
+    Never ship an entire state database containing unrelated conversations.
+    Shared dependencies (e.g. OpenCode projects) do not expand into sibling
+    sessions. All reads use one SQLite snapshot.
+    """
+    root, key, ownership = {
+        "codex": ("threads", "id", ("thread_id", "parent_thread_id", "child_thread_id")),
+        "opencode": ("session_v2", "id", ("session_id",)),
+        "agy": ("conversation_summaries", "conversation_id", ()),
+    }[agent.name]
+    conn = sqlite3.connect(agent.db.resolve().as_uri() + "?mode=ro", uri=True)
+    try:
+        conn.execute("BEGIN")
+        schemas = dict(conn.execute("SELECT name, sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND sql IS NOT NULL"))
+        columns = {t: [r[1] for r in conn.execute(f"PRAGMA table_info({sql_name(t)})")] for t in schemas}
+        relations = {}
+        for table in schemas:
+            groups = {}
+            for fk in conn.execute(f"PRAGMA foreign_key_list({sql_name(table)})"):
+                groups.setdefault((fk[0], fk[2]), []).append((fk[1], fk[3], fk[4]))
+            relations[table] = [(parent, sorted(fields)) for (_, parent), fields in groups.items()]
+        rows = {t: {} for t in schemas}
+
+        def fetch(table, names, values, owned):
+            if table not in columns or any(v is None for v in values):
+                return
+            query = ("SELECT " + ",".join(map(sql_name, columns[table])) + " FROM " + sql_name(table)
+                     + " WHERE " + " AND ".join(sql_name(n) + " = ?" for n in names))
+            for values in conn.execute(query, values):
+                encoded = [encoded_sql(v) for v in values]
+                identity = json.dumps(encoded, sort_keys=True)
+                previous = rows[table].get(identity)
+                rows[table][identity] = {"values": encoded, "owned": owned or bool(previous and previous["owned"])}
+
+        fetch(root, [key], [session.id], True)
+        if not rows[root]:
+            raise ValueError("Session no longer exists")
+        for table in schemas:
+            if "migration" in table.lower() or table.lower() in ("alembic_version", "schema_version"):
+                for values in conn.execute("SELECT " + ",".join(map(sql_name, columns[table])) + " FROM " + sql_name(table)):
+                    encoded = [encoded_sql(v) for v in values]
+                    rows[table][json.dumps(encoded, sort_keys=True)] = {"values": encoded, "owned": False}
+            for column in ownership:
+                if column in columns[table]:
+                    fetch(table, [column], [session.id], True)
+        # Follow child FKs only from owned rows, then follow parent dependencies.
+        for children in (True, False):
+            while True:
+                before = sum(len(v) for v in rows.values())
+                for child, links in relations.items():
+                    for parent, fields in links:
+                        if parent not in columns or any(not target for _, _, target in fields):
+                            continue
+                        if children:
+                            if child == root:
+                                continue
+                            for row in list(rows[parent].values()):
+                                if row["owned"]:
+                                    values = [decoded_sql(row["values"][columns[parent].index(target)]) for _, _, target in fields]
+                                    fetch(child, [name for _, name, _ in fields], values, True)
+                        elif parent != root:
+                            for row in list(rows[child].values()):
+                                values = [decoded_sql(row["values"][columns[child].index(name)]) for _, name, _ in fields]
+                                fetch(parent, [target for _, _, target in fields], values, False)
+                if sum(len(v) for v in rows.values()) == before:
+                    break
+        objects = list(conn.execute("SELECT name, sql FROM sqlite_master WHERE type IN ('index','trigger','view') AND sql IS NOT NULL"))
+        return {"root": root, "key": key, "schemas": schemas, "objects": objects,
+                "user_version": conn.execute("PRAGMA user_version").fetchone()[0],
+                "tables": {t: {"columns": columns[t], "rows": list(values.values())} for t, values in rows.items() if values}}
+    finally:
+        conn.close()
+
+
+def session_export(session):
+    agent = agent_of(session)
+    result = {"agent": agent.name, "id": session.id, "cwd": session.cwd, "files": []}
+
+    def file(path, slot, relative, database=False):
+        if path.is_symlink():
+            raise ValueError(f"Cannot migrate a symlink: {path}")
+        stamp = path.stat()
+        if database:
+            with tempfile.TemporaryDirectory(prefix="lmsessions-snapshot-") as tmp:
+                snapshot = Path(tmp) / "conversation.db"
+                source = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+                dest = sqlite3.connect(snapshot)
+                try:
+                    source.backup(dest)
+                finally:
+                    dest.close()
+                    source.close()
+                data = snapshot.read_bytes()
+        else:
+            data = path.read_bytes()
+            current = path.stat()
+            if (stamp.st_size, stamp.st_mtime_ns) != (current.st_size, current.st_mtime_ns):
+                raise ValueError(f"Session file changed during export: {path}")
+        result["files"].append({"slot": slot, "path": relative, "data": base64.b64encode(data).decode(),
+                                "mode": stamp.st_mode & 0o777, "mtime_ns": stamp.st_mtime_ns})
+
+    def tree(path, slot, prefix=""):
+        if path.is_symlink():
+            raise ValueError(f"Cannot migrate a symlink: {path}")
+        if path.exists():
+            for child in sorted(path.rglob("*")):
+                if child.is_symlink():
+                    raise ValueError(f"Cannot migrate a symlink: {child}")
+                if child.is_file():
+                    file(child, slot, prefix + child.relative_to(path).as_posix())
+
+    if agent.name == "claude":
+        file(session.path, "claude", session.id + ".jsonl")
+        tree(session.path.parent / session.id, "claude", session.id + "/")
+    else:
+        result["database"] = session_database(agent, session)
+        if agent.name == "codex":
+            file(session.path, "rollout", "rollout.jsonl" + (".zst" if session.path.suffix == ".zst" else ""))
+        elif agent.name == "agy":
+            tree(agent.brain / session.id, "brain")
+            conversation = agent.conversations / (session.id + ".db")
+            if conversation.exists():
+                file(conversation, "conversation", session.id + ".db", database=True)
+            annotation = agent.home / "annotations" / (session.id + ".pbtxt")
+            if annotation.exists():
+                file(annotation, "annotation", annotation.name)
+    return result
+
+
+def export_digest(packet):
+    return hashlib.sha256(json.dumps(packet, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def receive_sessions(payload):
+    """SSH receiver: stage files, import native rows without overwriting sessions.
+
+    Source deletion is exclusively the sender's responsibility after it checks
+    this receipt. On a lost connection the sender retains its original data.
+    """
+    directory = Path(payload["directory"]).expanduser().resolve(strict=True)
+    if not directory.is_dir():
+        raise ValueError(f"Not a remote directory: {directory}")
+    agents = {a.name: a for a in AGENTS}
+    connections = {}
+    created_databases = {}
+    committed_databases = set()
+    installed = []
+    committed = False
+    ids = set()
+    imported = []
+    try:
+        for packet in payload["sessions"]:
+            name, sid = packet["agent"], packet["id"]
+            if not sid or sid in (".", "..") or "/" in sid or "\\" in sid or "\0" in sid:
+                raise ValueError("Invalid session ID")
+            if (name, sid) in ids:
+                raise ValueError(f"Duplicate incoming session: {name}:{sid}")
+            ids.add((name, sid))
+            agent = agents[name]
+            if name == "claude":
+                projects = Path.home() / ".claude" / "projects"
+                if any(projects.glob(f"*/{sid}.jsonl")):
+                    raise ValueError(f"Remote session already exists: {name}:{sid}")
+                roots = {"claude": projects / agent.project_name(directory)}
+                main_path = roots["claude"] / (sid + ".jsonl")
+            else:
+                database = packet["database"]
+                if name not in connections:
+                    agent.db.parent.mkdir(parents=True, exist_ok=True)
+                    fresh = not agent.db.exists()
+                    if fresh:
+                        created_databases[name] = agent.db
+                    conn = sqlite3.connect(agent.db, timeout=10)
+                    connections[name] = conn
+                    conn.execute("PRAGMA foreign_keys = OFF")
+                    conn.execute("BEGIN IMMEDIATE")
+                    existing = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                    for table, ddl in database["schemas"].items():
+                        if table not in existing:
+                            conn.execute(ddl)
+                            existing = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                    if fresh:
+                        conn.execute(f"PRAGMA user_version = {int(database['user_version'])}")
+                conn = connections[name]
+                root, key = database["root"], database["key"]
+                if conn.execute(f"SELECT 1 FROM {sql_name(root)} WHERE {sql_name(key)} = ?", (sid,)).fetchone():
+                    raise ValueError(f"Remote session already exists: {name}:{sid}")
+                # Session/message UUIDs keep their identity. Local integer row
+                # IDs (notably Codex logs) can overlap on different machines;
+                # remap collisions together with their declared child FKs.
+                primary = {}
+                remaps = {}
+                for table, data in database["tables"].items():
+                    info = list(conn.execute(f"PRAGMA table_info({sql_name(table)})"))
+                    keys = [r for r in info if r[5]]
+                    if table == root or len(keys) != 1 or keys[0][2].upper() not in ("INTEGER", "TEXT"):
+                        continue
+                    column = keys[0][1]
+                    primary[table] = column
+                    offset = data["columns"].index(column)
+                    incoming = [row["values"][offset] for row in data["rows"] if row["owned"]]
+                    integer = keys[0][2].upper() == "INTEGER"
+                    incoming = [v for v in incoming if isinstance(v, int if integer else str)]
+                    highest = 0
+                    if integer:
+                        highest = conn.execute(f"SELECT MAX({sql_name(column)}) FROM {sql_name(table)}").fetchone()[0] or 0
+                        highest = max([highest] + incoming)
+                    for value in incoming:
+                        if conn.execute(f"SELECT 1 FROM {sql_name(table)} WHERE {sql_name(column)} = ?", (value,)).fetchone():
+                            highest += 1
+                            replacement = highest if integer else ((value.split("_", 1)[0] + "_" + uuid.uuid4().hex) if "_" in value else str(uuid.uuid4()))
+                            remaps.setdefault(table, {})[value] = replacement
+                if name == "codex":
+                    roots = {"rollout": agent.db.parent / "sessions" / "imported" / sid}
+                    main_path = roots["rollout"] / packet["files"][0]["path"]
+                elif name == "opencode":
+                    roots, main_path = {}, agent.db
+                else:
+                    roots = {"brain": agent.brain / sid, "conversation": agent.conversations,
+                             "annotation": agent.home / "annotations"}
+                    main_path = agent.log_path(sid)
+                # Insert only exported session rows and shared dependencies.
+                for table, data in database["tables"].items():
+                    target_columns = {r[1] for r in conn.execute(f"PRAGMA table_info({sql_name(table)})")}
+                    if not set(data["columns"]) <= target_columns:
+                        raise ValueError(f"Incompatible remote schema: {name}.{table}")
+                    for row in data["rows"]:
+                        values = dict(zip(data["columns"], map(decoded_sql, row["values"])))
+                        original_values = dict(values)
+                        if row["owned"] and table in remaps:
+                            column = primary[table]
+                            values[column] = remaps[table].get(values[column], values[column])
+                        for fk in conn.execute(f"PRAGMA foreign_key_list({sql_name(table)})"):
+                            parent, column, target = fk[2], fk[3], fk[4]
+                            if parent in remaps and (not target or target == primary[parent]) and column in values:
+                                values[column] = remaps[parent].get(values[column], values[column])
+                        replacements = {original_values[c]: v for c, v in values.items()
+                                        if isinstance(original_values[c], (str, int)) and original_values[c] != v}
+                        if replacements and isinstance(values.get("data"), str):
+                            def identities(value):
+                                if isinstance(value, dict):
+                                    for field, content in value.items():
+                                        if field in ("id", "messageID", "messageId", "message_id", "partID", "part_id", "log_id", "parentID", "parent_id") and isinstance(content, (str, int)):
+                                            value[field] = replacements.get(content, content)
+                                        elif field not in ("text", "input", "arguments", "output", "thinking"):
+                                            identities(content)
+                                elif isinstance(value, list):
+                                    for content in value:
+                                        identities(content)
+                            try:
+                                content = json.loads(values["data"])
+                            except ValueError:
+                                pass
+                            else:
+                                identities(content)
+                                values["data"] = json.dumps(content, ensure_ascii=False)
+                        if table == root:
+                            if name == "codex":
+                                values.update(cwd=str(directory), rollout_path=str(main_path))
+                            elif name == "opencode":
+                                values["directory"] = str(directory)
+                            else:
+                                uris = json.loads(values.get("workspace_uris") or "[]")
+                                values["workspace_uris"] = json.dumps([directory.as_uri()] + uris[1:])
+                        verb = "INSERT" if row["owned"] else "INSERT OR IGNORE"
+                        conn.execute(verb + " INTO " + sql_name(table) + " (" + ",".join(map(sql_name, values))
+                                     + ") VALUES (" + ",".join("?" for _ in values) + ")", tuple(values.values()))
+            # Stage beside each destination, so exclusive hard-link installation
+            # is atomic even when agent data and /tmp are different filesystems.
+            for item in packet["files"]:
+                relative = Path(item["path"])
+                if relative.is_absolute() or ".." in relative.parts or "\0" in item["path"]:
+                    raise ValueError("Invalid incoming file path")
+                if name == "claude" and not (relative.parts[0] == sid or item["path"] == sid + ".jsonl"):
+                    raise ValueError("Invalid Claude session file")
+                dest = roots[item["slot"]] / relative
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                fd, tmp = tempfile.mkstemp(prefix=".session-import-", dir=dest.parent)
+                staged = Path(tmp)
+                try:
+                    with os.fdopen(fd, "wb") as stream:
+                        stream.write(base64.b64decode(item["data"], validate=True))
+                    os.chmod(staged, item["mode"] & 0o777)
+                    os.utime(staged, ns=(item["mtime_ns"], item["mtime_ns"]))
+                    if name == "claude" and dest == main_path:
+                        agent.move(Session(name, sid, 0, 0, 0, "", staged, ""), directory)
+                    os.link(staged, dest)  # Refuse to overwrite any remote file.
+                    installed.append(dest)
+                finally:
+                    staged.unlink(missing_ok=True)
+            imported.append((name, sid))
+        # Add schema objects after inserting data; do not fire source triggers
+        # retroactively or replace objects installed by another agent version.
+        for packet in payload["sessions"]:
+            name = packet["agent"]
+            if name == "claude":
+                continue
+            conn = connections[name]
+            existing = {r[0] for r in conn.execute("SELECT name FROM sqlite_master")}
+            for obj_name, ddl in packet["database"]["objects"]:
+                if obj_name not in existing:
+                    conn.execute(ddl)
+                    existing.add(obj_name)
+        for name, conn in connections.items():
+            conn.commit()
+            committed = True
+            committed_databases.add(name)
+        visible = {(s.agent, s.id) for s in all_sessions(directory)}
+        if not set(imported) <= visible:
+            raise ValueError("Remote import did not appear in destination session listing")
+        return {"receipts": [export_digest(packet) for packet in payload["sessions"]], "directory": str(directory)}
+    except BaseException:
+        for conn in connections.values():
+            conn.rollback()
+        # A post-commit failure can leave a valid remote copy; retain it and
+        # keep the sender's source intact rather than removing committed data.
+        if not committed:
+            for path in reversed(installed):
+                path.unlink(missing_ok=True)
+        raise
+    finally:
+        for conn in connections.values():
+            conn.close()
+        for name, path in created_databases.items():
+            if name not in committed_databases:
+                for suffix in ("", "-wal", "-shm", "-journal"):
+                    Path(str(path) + suffix).unlink(missing_ok=True)
+
+
+def remove_exported_session(session, packet):
+    """Delete only the acknowledged snapshot, keeping shared metadata intact."""
+    agent = agent_of(session)
+    if session.agent == "claude":
+        if export_digest(session_export(session)) != export_digest(packet):
+            raise ValueError(f"{session.id} changed during transfer; source retained")
+        session.path.unlink()
+        companion = session.path.parent / session.id
+        if companion.exists():
+            shutil.rmtree(companion)
+        return
+    conn = sqlite3.connect(agent.db, timeout=10)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        if export_digest(session_export(session)) != export_digest(packet):
+            raise ValueError(f"{session.id} changed during transfer; source retained")
+        for table, data in reversed(list(packet["database"]["tables"].items())):
+            primary = [r[1] for r in sorted(conn.execute(f"PRAGMA table_info({sql_name(table)})"), key=lambda r: r[5]) if r[5]]
+            for row in data["rows"]:
+                if row["owned"]:
+                    values = dict(zip(data["columns"], map(decoded_sql, row["values"])))
+                    keys = primary or data["columns"]
+                    conn.execute("DELETE FROM " + sql_name(table) + " WHERE "
+                                 + " AND ".join(sql_name(c) + " IS ?" for c in keys),
+                                 tuple(values[c] for c in keys))
+        database = packet["database"]
+        if conn.execute(f"SELECT 1 FROM {sql_name(database['root'])} WHERE {sql_name(database['key'])} = ?", (session.id,)).fetchone():
+            raise ValueError("Source deletion did not complete; transaction rolled back")
+        conn.commit()
+    finally:
+        conn.close()
+    if session.agent == "codex":
+        session.path.unlink(missing_ok=True)
+    elif session.agent == "agy":
+        if (agent.brain / session.id).exists():
+            shutil.rmtree(agent.brain / session.id)
+        for suffix in (".db", ".db-shm", ".db-wal"):
+            (agent.conversations / (session.id + suffix)).unlink(missing_ok=True)
+        (agent.home / "annotations" / (session.id + ".pbtxt")).unlink(missing_ok=True)
+
+
+def clone_session(packet):
+    """Allocate a local copy's identity without altering prompt/body text."""
+    cloned = copy.deepcopy(packet)
+    old = packet["id"]
+    new = ("ses_" + uuid.uuid4().hex) if old.startswith("ses_") else str(uuid.uuid4())
+    cloned["id"] = new
+    names = {"session_id", "sessionId", "sessionID", "parentSessionId", "parent_session_id",
+             "thread_id", "parent_thread_id", "child_thread_id", "conversation_id", "conversationId"}
+
+    def metadata(value):
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if key in names and item == old:
+                    value[key] = new
+                elif key not in ("message", "content", "input", "arguments", "output", "text", "thinking") and isinstance(item, (dict, list)):
+                    metadata(item)
+            if value.get("type") == "session_meta" and isinstance(value.get("payload"), dict):
+                if value["payload"].get("id") == old:
+                    value["payload"]["id"] = new
+        elif isinstance(value, list):
+            for item in value:
+                metadata(item)
+
+    if "database" in cloned:
+        db = cloned["database"]
+        for table, data in db["tables"].items():
+            for row in data["rows"]:
+                if not row["owned"]:
+                    continue
+                for i, column in enumerate(data["columns"]):
+                    value = row["values"][i]
+                    if (column in names or (table == db["root"] and column == db["key"])) and value == old:
+                        row["values"][i] = new
+                    elif column == "data" and isinstance(value, str):
+                        try:
+                            content = json.loads(value)
+                        except ValueError:
+                            continue
+                        metadata(content)
+                        row["values"][i] = json.dumps(content, ensure_ascii=False)
+    for item in cloned["files"]:
+        item["path"] = "/".join(new + part[len(old):] if part == old or part.startswith(old + ".")
+                                  else part for part in item["path"].split("/"))
+        data = base64.b64decode(item["data"])
+        compressed = item["path"].endswith(".jsonl.zst")
+        if item["path"].endswith(".jsonl") or compressed:
+            if compressed:
+                if zstd is None:
+                    raise ValueError("Copying a compressed Codex rollout requires zstd support")
+                data = zstd.decompress(data)
+            lines = []
+            for line in data.splitlines(keepends=True):
+                try:
+                    record = json.loads(line)
+                except (ValueError, UnicodeDecodeError):
+                    lines.append(line)
+                    continue
+                metadata(record)
+                lines.append((json.dumps(record, ensure_ascii=False) + "\n").encode())
+            data = b"".join(lines)
+            if compressed:
+                data = zstd.compress(data)
+        elif item["slot"] == "conversation":
+            with tempfile.TemporaryDirectory(prefix="lmsessions-clone-") as tmp:
+                path = Path(tmp) / "conversation.db"
+                path.write_bytes(data)
+                with sqlite3.connect(path) as conn:
+                    for (table,) in conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").fetchall():
+                        for column in conn.execute(f"PRAGMA table_info({sql_name(table)})").fetchall():
+                            if column[1] in names or column[1] == "id":
+                                conn.execute(f"UPDATE {sql_name(table)} SET {sql_name(column[1])} = ? WHERE {sql_name(column[1])} = ?", (new, old))
+                data = path.read_bytes()
+        item["data"] = base64.b64encode(data).decode()
+    return cloned
+
+
+def move_remote(selected, destination, keep_source=False):
+    host, port, directory = destination
+    packets = [session_export(session) for session in selected]
+    bootstrap = (
+        "import json,sys; bundle=json.load(sys.stdin); ns={'__name__':'lmsessions_receiver'}; "
+        "exec(compile(bundle['program'],'<lmsessions>','exec'),ns); "
+        "print(json.dumps(ns['receive_sessions'](bundle['payload'])))"
+    )
+    command = ["ssh"] + (["-p", str(port)] if port else [])
+    ssh_host = re.sub(r"^(.*@)?\[([^\]]+)\]$", lambda m: (m[1] or "") + m[2], host)
+    command += ["--", ssh_host, "python3 -c " + shlex.quote(bootstrap)]
+    bundle = {"program": Path(__file__).read_text(), "payload": {"directory": directory, "sessions": packets}}
+    result = subprocess.run(command, input=json.dumps(bundle).encode(), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if result.returncode:
+        raise ValueError("Remote import failed; source sessions retained.\n" + result.stderr.decode(errors="replace").strip())
+    try:
+        receipt = json.loads(result.stdout)
+    except ValueError:
+        raise ValueError("Invalid remote receipt; source sessions retained") from None
+    if not isinstance(receipt, dict) or receipt.get("receipts") != [export_digest(packet) for packet in packets]:
+        raise ValueError("Invalid remote receipt; source sessions retained")
+    if not keep_source:
+        for session, packet in zip(selected, packets):
+            if export_digest(session_export(session)) != export_digest(packet):
+                raise ValueError(f"{session.agent}:{session.id} changed during transfer; source retained")
+        for session, packet in zip(selected, packets):
+            remove_exported_session(session, packet)
+    action = "Copied" if keep_source else "Moved"
+    print(f"{action} {len(selected)} session(s) to {host}:{receipt['directory']}")
+    return 0
+
+
+def move_sessions(source: str, directory, keep_source=False) -> int:
     """Reassign an exact session ID, or every session in one source directory."""
     try:
-        directory = directory.expanduser().resolve(strict=True)
-        if not directory.is_dir():
-            raise ValueError(f"Not a directory: {directory}")
+        remote = remote_destination(str(directory))
+        if remote is None:
+            directory = Path(directory).expanduser().resolve(strict=True)
+            if not directory.is_dir():
+                raise ValueError(f"Not a directory: {directory}")
         source_path = Path(source).expanduser()
         source_dir = source_path.resolve() if source_path.is_dir() else None
         sessions = all_sessions(None)
@@ -3480,6 +3998,14 @@ def move_sessions(source: str, directory: Path) -> int:
                                  ", ".join(f"{s.agent}:{s.id}" for s in selected) + ")")
         if not selected:
             raise ValueError(f"No sessions found for {source}")
+        if remote is not None:
+            return move_remote(selected, remote, keep_source)
+        if keep_source:
+            packets = [clone_session(session_export(session)) for session in selected]
+            receive_sessions({"directory": str(directory), "sessions": packets})
+            for session, packet in zip(selected, packets):
+                print(f"Copied {session.agent}:{session.id} -> {packet['id']} ({directory})")
+            return 0
     except (OSError, ValueError, sqlite3.Error) as e:
         print(f"Cannot move sessions: {e}", file=sys.stderr)
         return 1
@@ -3515,15 +4041,18 @@ def main() -> int:
         help="apply to sessions in every directory, not just $PWD",
     )
     commands = parser.add_subparsers(dest="command")
-    move = commands.add_parser("mv", help="change session workspace metadata")
-    move.add_argument("source", help="exact session ID (or agent:ID), or a source directory")
-    move.add_argument("directory", nargs="?", type=Path, default=Path.cwd(),
-                      help="destination directory (default: current directory)")
+    for name in ("mv", "cp"):
+        transfer = commands.add_parser(name, help="move session workspaces" if name == "mv" else "copy sessions")
+        transfer.add_argument("source", help="exact session ID (or agent:ID), or a source directory")
+        transfer.add_argument("directory", nargs="?", default=str(Path.cwd()),
+                              help="directory, [user@]host:path or ssh://[user@]host[:port]/path (default: current directory)")
+        if name == "mv":
+            transfer.add_argument("--keep-source", action="store_true", help="copy sessions (alias for cp)")
     args = parser.parse_args()
-    if args.command == "mv":
+    if args.command in ("mv", "cp"):
         if args.l or args.all:
-            parser.error("mv cannot be combined with -l/--list or -a/--all")
-        return move_sessions(args.source, args.directory)
+            parser.error("mv/cp cannot be combined with -l/--list or -a/--all")
+        return move_sessions(args.source, args.directory, args.command == "cp" or args.keep_source)
     cwd = None if args.all else Path(os.getcwd()).resolve()
     return list_sessions(cwd) if args.l else interactive_menu(cwd)
 

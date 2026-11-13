@@ -17,6 +17,8 @@ picker. No tests, no build step; verify by running it.
 | `-l -a`           | `list_sessions(None)`                     |
 | `mv ID [DIR]`     | reassign one session's workspace          |
 | `mv SOURCE [DIR]` | reassign all sessions in SOURCE directory |
+| `cp ID [DIR]`     | copy one session (new ID locally)          |
+| `cp SOURCE [DIR]` | copy all sessions in SOURCE directory     |
 
 `cwd` is `Path | None` everywhere; `None` means "every directory" and also
 turns on the CWD column.
@@ -31,6 +33,34 @@ Claude listing scans all project buckets and filters by recorded cwd, since a
 moved session stays in its original storage bucket. A missing Claude cwd gets
 a leading workspace metadata record. Batch moves report successes, no-ops and
 failures; failures return nonzero, and completed session moves remain applied.
+
+`mv`/`cp` also accept `[user@]host:path` and `ssh://[user@]host[:port]/path`.
+`remote_destination()` parses these before local Path normalization; local
+sources are still exact IDs or nonrecursive directory selections. `cp` (and
+the `mv --keep-source` alias) retains sources. Local `cp` uses `clone_session()`
+to allocate fresh IDs and rewrite identity metadata, leaving prompt text intact.
+SSH `cp` preserves IDs and refuses existing remote sessions/files.
+
+`session_export()` packages native rows/files, using `session_database()` to
+read a consistent SQLite snapshot of owned records, FK children, parent/shared
+dependencies and migration metadata. Unrelated conversation rows are excluded.
+Binary values/files are base64 encoded. `move_remote()` invokes ordinary SSH
+with a quoted Python bootstrap, streaming this script and the payload as JSON
+on stdin; remote lmsessions installation is optional. `receive_sessions()`
+stages files, inserts rows transactionally, reassigns workspace/rollout paths,
+and verifies destination listing before issuing SHA-256 receipts. Shared data
+is retained; colliding auxiliary row IDs and declared FKs are remapped. Whole
+remote databases and existing session files are never overwritten. Native
+schemas can be bootstrapped from source schema/migration records; incompatible
+existing schemas fail rather than silently dropping columns.
+
+Only after valid receipts and unchanged-source checks does remote `mv` call
+`remove_exported_session()`, deleting owned rows and files while keeping shared
+metadata. DB cleanup rechecks under a write lock and deletes by primary key
+(triggers can update other columns). Failed SSH/import/receipt validation keeps
+the source. A lost acknowledgement can leave a remote copy. Multiple database
+commits/source cleanups are not a distributed transaction: later failures can
+leave partial remote imports or completed moves, with verified copies retained.
 
 ## Data model
 
