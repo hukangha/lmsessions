@@ -7,14 +7,14 @@ picker. No tests, no build step; verify by running it.
 
 ## Entry point
 
-`main()` parses `-l/--list` and `-a/--all`, then:
+`main()` parses the `ls`/`mv`/`cp` subcommands and `-a/--all`, then:
 
 | invocation        | behavior                                  |
 |-------------------|-------------------------------------------|
 | (none)            | `interactive_menu($PWD)`                  |
 | `-a`              | `interactive_menu(None)` = every dir      |
-| `-l`              | `list_sessions($PWD)`                     |
-| `-l -a`           | `list_sessions(None)`                     |
+| `ls`              | `list_sessions($PWD)`                     |
+| `ls -a` / `-a ls` | `list_sessions(None)`                     |
 | `mv ID [DIR]`     | reassign one session's workspace          |
 | `mv SOURCE [DIR]` | reassign all sessions in SOURCE directory |
 | `cp ID [DIR]`     | copy one session (new ID locally)          |
@@ -22,6 +22,9 @@ picker. No tests, no build step; verify by running it.
 
 `cwd` is `Path | None` everywhere; `None` means "every directory" and also
 turns on the CWD column.
+`ls` replaces the former `-l/--list` flags. Its `--all` default is suppressed
+in argparse so a global `-a` before `ls` remains effective. Transfer commands
+reject `-a`; no subcommand still opens the picker.
 
 `move_sessions()` resolves an exact ID (or `agent:ID`) across all agents, or
 matches a source directory by realpath without recursion. The destination is

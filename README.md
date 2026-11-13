@@ -12,6 +12,8 @@ Run with no arguments for the interactive menu:
 
 Requires Python 3.10+
 
+Use `lmsessions ls` for a plain list in the current directory, or `lmsessions ls -a` for every directory. Running `lmsessions` without a subcommand opens the interactive picker.
+
 Move or copy sessions:
 
 ```sh
@@ -21,7 +23,7 @@ lmsessions cp <session-id> [directory]
 lmsessions cp <source-directory> [directory]
 ```
 
-The destination defaults to the current directory and must already exist. A source directory selects sessions from that directory across all agents (without recursion). Local `mv` updates workspace metadata, keeping transcript files at their original paths. Local `cp` creates independent copies with new session IDs, printed in the output. Run `lmsessions` or `lmsessions -l` in the destination to see them. Use `agent:session-id` when an ID is shared by multiple agents.
+The destination defaults to the current directory and must already exist. A source directory selects sessions from that directory across all agents (without recursion). Local `mv` updates workspace metadata, keeping transcript files at their original paths. Local `cp` creates independent copies with new session IDs, printed in the output. Run `lmsessions` or `lmsessions ls` in the destination to see them. Use `agent:session-id` when an ID is shared by multiple agents.
 
 SSH destinations are supported for both commands:
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """List, search, remove or resume coding-agent sessions (Claude Code, Codex,
-OpenCode, Antigravity). With no arguments, open the interactive menu; -l lists
+OpenCode, Antigravity). With no arguments, open the interactive menu; ls lists
 them instead; -a covers every directory, not just $PWD. Press / in the menu to
 search.
 
@@ -3327,7 +3327,7 @@ def view_session(s: Session, options: ViewOptions | None = None) -> None:
 
 def interactive_menu(cwd: Path | None) -> int:
     if not sys.stdin.isatty():
-        print("The interactive menu needs a terminal; pass -l to list sessions.", file=sys.stderr)
+        print("The interactive menu needs a terminal; use 'lmsessions ls' to list sessions.", file=sys.stderr)
         return 1
     rows = all_sessions(cwd)
     if not rows:
@@ -4029,10 +4029,7 @@ def main() -> int:
         description="List, search, remove or resume "
         + "/".join(a.name for a in AGENTS)
         + " sessions; with no arguments, open the interactive menu "
-        "(-l lists them; -a covers every directory).",
-    )
-    parser.add_argument(
-        "-l", "--list", dest="l", action="store_true", help="list sessions for $PWD"
+        "(ls lists them; -a covers every directory).",
     )
     parser.add_argument(
         "-a",
@@ -4041,6 +4038,9 @@ def main() -> int:
         help="apply to sessions in every directory, not just $PWD",
     )
     commands = parser.add_subparsers(dest="command")
+    listing = commands.add_parser("ls", help="list sessions for $PWD")
+    listing.add_argument("-a", "--all", action="store_true", default=argparse.SUPPRESS,
+                         help="list sessions in every directory")
     for name in ("mv", "cp"):
         transfer = commands.add_parser(name, help="move session workspaces" if name == "mv" else "copy sessions")
         transfer.add_argument("source", help="exact session ID (or agent:ID), or a source directory")
@@ -4050,11 +4050,11 @@ def main() -> int:
             transfer.add_argument("--keep-source", action="store_true", help="copy sessions (alias for cp)")
     args = parser.parse_args()
     if args.command in ("mv", "cp"):
-        if args.l or args.all:
-            parser.error("mv/cp cannot be combined with -l/--list or -a/--all")
+        if args.all:
+            parser.error("mv/cp cannot be combined with -a/--all")
         return move_sessions(args.source, args.directory, args.command == "cp" or args.keep_source)
     cwd = None if args.all else Path(os.getcwd()).resolve()
-    return list_sessions(cwd) if args.l else interactive_menu(cwd)
+    return list_sessions(cwd) if args.command == "ls" else interactive_menu(cwd)
 
 
 if __name__ == "__main__":
