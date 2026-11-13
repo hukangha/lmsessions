@@ -4,8 +4,10 @@ List, search, view, remove or resume Claude Code, Codex, OpenCode and Google Ant
 
 Run with no arguments for the interactive menu:
 
-/  to search,
-v to open vim viewer.
-s to sort
+`/`  to search
+
+`v` to open vim viewer
+
+`s` to sort
 
 Requires Python 3.10+
