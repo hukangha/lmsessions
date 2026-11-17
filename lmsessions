@@ -1219,6 +1219,19 @@ def pick_sessions(
         if picker_top is not None:
             picker_top = cursor_row(fd)  # the frame moved: clicks need the new row
 
+    def confirm_quit() -> bool:
+        """Ask before leaving the whole menu: Enter quits (True); Esc or any
+        other key stays put (False). Shown in the footer, matching the
+        [Enter/Esc] confirm ask_enter/confirm_remove use elsewhere."""
+        prompt = "Quit lmsessions? [Enter/Esc]"
+        while True:
+            frame(prompt)
+            key = next_key()
+            if key == "resize":
+                resize()
+                continue
+            return key in ("\r", "\n")
+
     old = termios.tcgetattr(fd)
     tty.setcbreak(fd)
     # A resize must wake the blocked key read: Python retries the interrupted
@@ -1366,7 +1379,8 @@ def pick_sessions(
             elif key == "esc" and (hits is not None or can_back):
                 return "back", None, rows[cur], (sort_attr, reverse)
             elif key in ("q", "esc"):
-                return None
+                if confirm_quit():
+                    return None
     except KeyboardInterrupt:
         return None
     finally:
